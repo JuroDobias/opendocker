@@ -36,6 +36,7 @@ Current core constraint is based on template-derived ligand-protein distance res
 - match SMARTS on template ligand (`reference_core_sdf`)
 - for each matched template atom, pick nearest receptor heavy atom and store reference distance
 - match SMARTS on query ligand; try up to `max_query_mappings` query matches
+- initialize each mapping from template-guided geometry (`template_constrained_embed`) with rigid core pre-alignment (`rigid_prealign`)
 - for each mapping, apply flat-bottom quadratic restraint with:
   - `tolerance` (half-width)
   - `force_constant` (penalty strength)

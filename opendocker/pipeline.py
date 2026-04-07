@@ -228,6 +228,8 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         core.setdefault("tolerance", 0.5)
         core.setdefault("force_constant", 1.0)
         core.setdefault("max_query_mappings", 16)
+        core.setdefault("template_constrained_embed", True)
+        core.setdefault("template_constrained_embed_max_attempts", 20)
         core.setdefault("rigid_prealign", True)
         if float(core["tolerance"]) < 0:
             raise ValueError("constraints.core.tolerance must be >= 0")
@@ -235,6 +237,8 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("constraints.core.force_constant must be >= 0")
         if int(core["max_query_mappings"]) < 1:
             raise ValueError("constraints.core.max_query_mappings must be >= 1")
+        if int(core["template_constrained_embed_max_attempts"]) < 1:
+            raise ValueError("constraints.core.template_constrained_embed_max_attempts must be >= 1")
 
     _must_get(runtime, "exhaustiveness")
     _must_get(runtime, "num_modes")
@@ -402,6 +406,45 @@ def _rigid_align_rdkit_to_template_core(
         v2 = v @ r.T + t
         conf.SetAtomPosition(atom_idx, (float(v2[0]), float(v2[1]), float(v2[2])))
     return aligned
+
+
+def _constrained_embed_rdkit_to_template_core(
+    mol: Chem.Mol,
+    ligand_core_match: tuple[int, ...],
+    template_core_xyz: np.ndarray,
+    max_attempts: int,
+) -> tuple[Chem.Mol, bool, str]:
+    if len(ligand_core_match) != int(template_core_xyz.shape[0]):
+        return mol, False, "constrained_embed_failed:core_atom_count_mismatch"
+
+    # Build a query-derived core submolecule and place its atoms at template-core coordinates.
+    idx_map: dict[int, int] = {}
+    rw = Chem.RWMol()
+    for src_idx in ligand_core_match:
+        idx_map[int(src_idx)] = rw.AddAtom(Chem.Atom(mol.GetAtomWithIdx(int(src_idx))))
+    for bond in mol.GetBonds():
+        b = int(bond.GetBeginAtomIdx())
+        e = int(bond.GetEndAtomIdx())
+        if b in idx_map and e in idx_map:
+            rw.AddBond(idx_map[b], idx_map[e], bond.GetBondType())
+    core = rw.GetMol()
+    core_conf = Chem.Conformer(len(ligand_core_match))
+    for i in range(len(ligand_core_match)):
+        xyz = template_core_xyz[i]
+        core_conf.SetAtomPosition(i, (float(xyz[0]), float(xyz[1]), float(xyz[2])))
+    core.AddConformer(core_conf, assignId=True)
+
+    try:
+        embedded = AllChem.ConstrainedEmbed(
+            Chem.Mol(mol),
+            core,
+            maxAttempts=int(max_attempts),
+            randomseed=0xC0DE,
+            useTethers=True,
+        )
+        return embedded, True, ""
+    except Exception as exc:
+        return mol, False, f"constrained_embed_failed:{exc}"
 
 
 def _load_reference_template(reference_sdf: str, reference_smarts: str) -> tuple[Chem.Mol, tuple[int, ...], np.ndarray]:
@@ -1014,6 +1057,7 @@ def _run_single_ligand(
     best_error_note = ""
     best_manifest: dict[str, Any] | None = None
     best_reuse_info: dict[str, Any] | None = None
+    best_init_info: dict[str, Any] | None = None
     last_mapping_error = ""
 
     for map_idx, match in enumerate(selected_matches):
@@ -1022,13 +1066,31 @@ def _run_single_ligand(
 
         try:
             map_lig_rdkit = lig_rdkit
-            map_lig_pdbqt = lig_pdbqt
+            init_method = "free"
+            init_warning = ""
+
+            if bool(core_cfg.get("template_constrained_embed", True)):
+                map_lig_rdkit, ok_embed, warn_embed = _constrained_embed_rdkit_to_template_core(
+                    mol=map_lig_rdkit,
+                    ligand_core_match=match,
+                    template_core_xyz=template_core_xyz,
+                    max_attempts=int(core_cfg.get("template_constrained_embed_max_attempts", 20)),
+                )
+                if ok_embed:
+                    init_method = "constrained_embed"
+                elif warn_embed:
+                    init_warning = warn_embed
+
             if bool(core_cfg.get("rigid_prealign", True)):
-                map_lig_rdkit = _rigid_align_rdkit_to_template_core(lig_rdkit, match, template_core_xyz)
-                aligned_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.aligned.sdf")
-                map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.aligned.pdbqt")
-                _write_rdkit_sdf(map_lig_rdkit, aligned_sdf)
-                _to_pdbqt(aligned_sdf, map_lig_pdbqt)
+                map_lig_rdkit = _rigid_align_rdkit_to_template_core(map_lig_rdkit, match, template_core_xyz)
+                if init_method == "constrained_embed":
+                    init_method = "constrained_embed+rigid"
+                else:
+                    init_method = "rigid"
+            prepared_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.sdf")
+            map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.pdbqt")
+            _write_rdkit_sdf(map_lig_rdkit, prepared_sdf)
+            _to_pdbqt(prepared_sdf, map_lig_pdbqt)
 
             stage_keys = _build_stage_keys(
                 cfg=cfg,
@@ -1068,6 +1130,12 @@ def _run_single_ligand(
             best_error_note = mapping_error
             best_manifest = mapping_manifest
             best_reuse_info = reuse_info
+            best_init_info = {
+                "method": init_method,
+                "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
+                "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
+                "warning": init_warning,
+            }
 
     if best_selected_records is None:
         if last_mapping_error:
@@ -1106,6 +1174,8 @@ def _run_single_ligand(
     best_manifest["mappings_tested"] = len(selected_matches)
     best_manifest["mappings_total"] = len(query_matches)
     best_manifest["mappings_truncated"] = bool(truncated)
+    if best_init_info:
+        best_manifest["initialization"] = best_init_info
     if best_reuse_info:
         best_manifest["reuse"] = {
             "reused_docking": bool(best_reuse_info.get("reused_docking", False)),
@@ -1124,6 +1194,8 @@ def _run_single_ligand(
         )
     if best_error_note:
         error_messages.append(best_error_note)
+    if best_init_info and best_init_info.get("warning"):
+        error_messages.append(str(best_init_info["warning"]))
     reuse_note = ""
     if best_reuse_info and best_reuse_info.get("notes"):
         reuse_note = ",".join(best_reuse_info["notes"])
