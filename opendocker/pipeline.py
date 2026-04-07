@@ -228,6 +228,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         core.setdefault("tolerance", 0.5)
         core.setdefault("force_constant", 1.0)
         core.setdefault("max_query_mappings", 16)
+        core.setdefault("rigid_prealign", True)
         if float(core["tolerance"]) < 0:
             raise ValueError("constraints.core.tolerance must be >= 0")
         if float(core["force_constant"]) < 0:
@@ -365,6 +366,42 @@ def _prepare_ligand_files(ligand: LigandInput, work_dir: str) -> tuple[str, str,
     _write_rdkit_sdf(mol, sdf_path)
     _to_pdbqt(sdf_path, pdbqt_path)
     return sdf_path, pdbqt_path, mol
+
+
+def _rigid_align_rdkit_to_template_core(
+    mol: Chem.Mol,
+    ligand_core_match: tuple[int, ...],
+    template_core_xyz: np.ndarray,
+) -> Chem.Mol:
+    if len(ligand_core_match) != int(template_core_xyz.shape[0]):
+        raise ValueError("Rigid prealignment failed: core atom count mismatch")
+    aligned = Chem.Mol(mol)
+    conf = aligned.GetConformer()
+    probe_xyz = np.array(
+        [[conf.GetAtomPosition(i).x, conf.GetAtomPosition(i).y, conf.GetAtomPosition(i).z] for i in ligand_core_match],
+        dtype=np.float64,
+    )
+    target_xyz = template_core_xyz.astype(np.float64)
+
+    probe_center = probe_xyz.mean(axis=0)
+    target_center = target_xyz.mean(axis=0)
+    probe0 = probe_xyz - probe_center
+    target0 = target_xyz - target_center
+
+    h = probe0.T @ target0
+    u, _, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1
+        r = vt.T @ u.T
+    t = target_center - (probe_center @ r.T)
+
+    for atom_idx in range(aligned.GetNumAtoms()):
+        p = conf.GetAtomPosition(atom_idx)
+        v = np.array([p.x, p.y, p.z], dtype=np.float64)
+        v2 = v @ r.T + t
+        conf.SetAtomPosition(atom_idx, (float(v2[0]), float(v2[1]), float(v2[2])))
+    return aligned
 
 
 def _load_reference_template(reference_sdf: str, reference_smarts: str) -> tuple[Chem.Mol, tuple[int, ...], np.ndarray]:
@@ -984,6 +1021,15 @@ def _run_single_ligand(
             continue
 
         try:
+            map_lig_rdkit = lig_rdkit
+            map_lig_pdbqt = lig_pdbqt
+            if bool(core_cfg.get("rigid_prealign", True)):
+                map_lig_rdkit = _rigid_align_rdkit_to_template_core(lig_rdkit, match, template_core_xyz)
+                aligned_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.aligned.sdf")
+                map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.aligned.pdbqt")
+                _write_rdkit_sdf(map_lig_rdkit, aligned_sdf)
+                _to_pdbqt(aligned_sdf, map_lig_pdbqt)
+
             stage_keys = _build_stage_keys(
                 cfg=cfg,
                 ligand_input=ligand_input,
@@ -995,8 +1041,8 @@ def _run_single_ligand(
             selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
                 cfg=cfg,
                 receptor_pdbqt=receptor_pdbqt,
-                lig_pdbqt=lig_pdbqt,
-                lig_rdkit=lig_rdkit,
+                lig_pdbqt=map_lig_pdbqt,
+                lig_rdkit=map_lig_rdkit,
                 template_core_match=template_core_match,
                 ligand_core_match=match,
                 mapping_index=map_idx,

@@ -36,6 +36,7 @@ constraints:
     tolerance: 0.5
     force_constant: 1.0
     max_query_mappings: 16
+    rigid_prealign: true
     # deprecated/ignored in distance-restraint mode:
     # max_core_rmsd: 2.0
 
