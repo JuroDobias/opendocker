@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,21 @@ def _enable_deeprmsd_torch_load_compat() -> None:
     if getattr(torch, "_opendocker_deeprmsd_torchload_patched", False):
         return
 
+    # Legacy DeepRMSD checkpoints may reference __main__.CNN.
+    try:
+        from opendock.scorer.deeprmsd import CNN as _DeepRMSDCNN
+
+        main_mod = sys.modules.get("__main__")
+        if main_mod is not None and not hasattr(main_mod, "CNN"):
+            setattr(main_mod, "CNN", _DeepRMSDCNN)
+
+        try:
+            torch.serialization.add_safe_globals([_DeepRMSDCNN])
+        except Exception:
+            pass
+    except Exception:
+        _DeepRMSDCNN = None
+
     original_load = torch.load
 
     def _patched_torch_load(f, *args, **kwargs):
@@ -83,7 +99,9 @@ def _enable_deeprmsd_torch_load_compat() -> None:
         except Exception as exc:
             path = str(f)
             msg = str(exc)
-            if "deeprmsd_model" in path and "Weights only load failed" in msg:
+            if "deeprmsd_model" in path and (
+                "Weights only load failed" in msg or "__main__.CNN" in msg or "Can't get attribute 'CNN'" in msg
+            ):
                 retry_kwargs = dict(kwargs)
                 retry_kwargs["weights_only"] = False
                 return original_load(f, *args, **retry_kwargs)
