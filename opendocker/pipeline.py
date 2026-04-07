@@ -63,6 +63,34 @@ MINIMIZERS = {
 }
 
 
+def _enable_deeprmsd_torch_load_compat() -> None:
+    """Compat for legacy DeepRMSD pickle on newer PyTorch.
+
+    OpenDock's DeepRMSD model file is a pickled module object. PyTorch 2.6+
+    defaults torch.load(..., weights_only=True), which rejects this file.
+    We retry with weights_only=False only for the DeepRMSD model checkpoint.
+    """
+    if getattr(torch, "_opendocker_deeprmsd_torchload_patched", False):
+        return
+
+    original_load = torch.load
+
+    def _patched_torch_load(f, *args, **kwargs):
+        try:
+            return original_load(f, *args, **kwargs)
+        except Exception as exc:
+            path = str(f)
+            msg = str(exc)
+            if "deeprmsd_model" in path and "Weights only load failed" in msg:
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["weights_only"] = False
+                return original_load(f, *args, **retry_kwargs)
+            raise
+
+    torch.load = _patched_torch_load
+    torch._opendocker_deeprmsd_torchload_patched = True
+
+
 @dataclass
 class LigandInput:
     ligand_id: str
@@ -749,6 +777,12 @@ def _run_single_ligand(
 
 def run_from_config(config_path: str) -> None:
     cfg = _load_config(config_path)
+
+    requested_scorers = {cfg["docking"]["primary_scorer"]}
+    if cfg["rescoring"].get("enabled", False):
+        requested_scorers.add(cfg["rescoring"]["scorer"])
+    if {"deeprmsd", "rmsd-vina"} & requested_scorers:
+        _enable_deeprmsd_torch_load_compat()
 
     if cfg.get("constraints", {}).get("core", {}).get("enabled", False):
         if "max_core_rmsd" in cfg["constraints"]["core"]:
