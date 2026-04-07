@@ -1300,16 +1300,22 @@ def _run_single_ligand(
     best_error_note = ""
     best_manifest: dict[str, Any] | None = None
     best_reuse_info: dict[str, Any] | None = None
-    best_init_info: dict[str, Any] | None = None
+    best_init_warning = ""
     best_conformer_index: int | None = None
     best_input_pdbqt: str | None = None
     last_mapping_error = ""
 
     init_conf_cfg = core_cfg.get("init_conformers", {}) or {}
+    init_conf_cfg_per_map = dict(init_conf_cfg)
+    # Apply max_output_conformers globally across mappings, not per mapping.
+    init_conf_cfg_per_map["max_output_conformers"] = None
     dedup_rmsd_threshold = float(init_conf_cfg.get("rmsd_threshold", 0.5))
+    global_max_output = init_conf_cfg.get("max_output_conformers")
+    global_max_output = int(global_max_output) if global_max_output is not None else None
     generated_total = 0
     mapping_local_kept_total = 0
     dedup_removed_total = 0
+    cap_removed_total = 0
     candidate_pool: list[dict[str, Any]] = []
     candidate_sources: list[dict[str, int]] = []
 
@@ -1345,7 +1351,7 @@ def _run_single_ligand(
                 map_lig_rdkit=map_lig_rdkit,
                 ligand_core_match=match,
                 template_core_xyz=template_core_xyz,
-                conf_cfg=init_conf_cfg,
+                conf_cfg=init_conf_cfg_per_map,
             )
             generated_total += int(conf_info.get("generated_count", len(variant_mols)))
             mapping_local_kept_total += int(conf_info.get("kept_count", len(variant_mols)))
@@ -1361,19 +1367,7 @@ def _run_single_ligand(
                         "conformer_index": conf_idx,
                         "ligand_core_match": match,
                         "mol": run_mol,
-                        "initialization": {
-                            "method": init_method,
-                            "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
-                            "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
-                            "warning": " | ".join([x for x in [init_warning, conf_warn] if x]),
-                            "init_conformers": {
-                                "enabled": bool(init_conf_cfg.get("enabled", False)),
-                                "generated_count": int(conf_info.get("generated_count", len(variant_mols))),
-                                "kept_count": int(conf_info.get("kept_count", len(variant_mols))),
-                                "rmsd_threshold": float(init_conf_cfg.get("rmsd_threshold", 0.5)),
-                                "max_output_conformers": init_conf_cfg.get("max_output_conformers"),
-                            },
-                        },
+                        "init_warning": " | ".join([x for x in [init_warning, conf_warn] if x]),
                     }
                 )
 
@@ -1387,6 +1381,10 @@ def _run_single_ligand(
         except Exception as exc:
             last_mapping_error = str(exc)
             continue
+
+    if global_max_output is not None and len(candidate_pool) > int(global_max_output):
+        cap_removed_total = int(len(candidate_pool) - int(global_max_output))
+        candidate_pool = candidate_pool[: int(global_max_output)]
 
     for cand in candidate_pool:
         map_idx = int(cand["mapping_index"])
@@ -1442,7 +1440,7 @@ def _run_single_ligand(
             best_error_note = mapping_error
             best_manifest = mapping_manifest
             best_reuse_info = reuse_info
-            best_init_info = cand.get("initialization")
+            best_init_warning = str(cand.get("init_warning", "") or "")
             best_input_pdbqt = map_lig_pdbqt
 
     if best_selected_records is None:
@@ -1487,14 +1485,15 @@ def _run_single_ligand(
     best_manifest["candidate_dedup"] = {
         "rmsd_metric": "symmetry_aware_heavy_atom_rmsd",
         "rmsd_threshold": float(dedup_rmsd_threshold),
+        "max_output_conformers_global": global_max_output,
         "generated_total": int(generated_total),
         "mapping_local_kept_total": int(mapping_local_kept_total),
+        "unique_candidates_before_cap": int(len(candidate_pool) + cap_removed_total),
         "unique_candidates": int(len(candidate_pool)),
         "duplicates_removed": int(dedup_removed_total),
+        "cap_removed": int(cap_removed_total),
         "accepted_candidates": candidate_sources,
     }
-    if best_init_info:
-        best_manifest["initialization"] = best_init_info
     if best_reuse_info:
         best_manifest["reuse"] = {
             "reused_docking": bool(best_reuse_info.get("reused_docking", False)),
@@ -1513,8 +1512,8 @@ def _run_single_ligand(
         )
     if best_error_note:
         error_messages.append(best_error_note)
-    if best_init_info and best_init_info.get("warning"):
-        error_messages.append(str(best_init_info["warning"]))
+    if best_init_warning:
+        error_messages.append(best_init_warning)
     reuse_note = ""
     if best_reuse_info and best_reuse_info.get("notes"):
         reuse_note = ",".join(best_reuse_info["notes"])
