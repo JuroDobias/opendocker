@@ -43,6 +43,7 @@ runtime:
   exhaustiveness: 8
   num_modes: 20
   threads: 1
+  reuse_enabled: true
 
 outputs:
   dir: ./output

@@ -1,4 +1,6 @@
 import csv
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -217,6 +219,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     _must_get(runtime, "exhaustiveness")
     _must_get(runtime, "num_modes")
+    runtime.setdefault("reuse_enabled", True)
     _must_get(outputs, "dir")
     _must_get(outputs, "top_n")
 
@@ -233,6 +236,55 @@ def _load_config(path: str) -> dict[str, Any]:
 
 def _ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _stable_hash(data: Any) -> str:
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _atomic_torch_save(obj: Any, path: str) -> None:
+    tmp = f"{path}.tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_yaml_dump(data: dict[str, Any], path: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(data, fh, sort_keys=False)
+    os.replace(tmp, path)
+
+
+def _safe_yaml_load(path: str) -> dict[str, Any] | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            val = yaml.safe_load(fh)
+    except Exception:
+        return None
+    return val if isinstance(val, dict) else None
+
+
+def _safe_torch_load(path: str) -> Any | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        return torch.load(path, map_location="cpu")
+    except Exception:
+        return None
 
 
 def _read_smiles(path: str) -> list[LigandInput]:
@@ -391,6 +443,148 @@ def _core_rmsd_for_pose(ligand: LigandConformation, cnfr: torch.Tensor, ligand_c
     return float(rmsd)
 
 
+def _to_serializable_cfg_subset(cfg: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+    return {k: cfg[k] for k in keys if k in cfg}
+
+
+def _build_stage_keys(
+    cfg: dict[str, Any],
+    ligand_input: LigandInput,
+    ligand_core_match: tuple[int, ...],
+    mapping_index: int,
+    file_hashes: dict[str, str],
+) -> dict[str, str]:
+    query_smarts = cfg["inputs"].get("ligand_core_smarts") or cfg["inputs"]["reference_core_smarts"]
+    base = {
+        "ligand_id": ligand_input.ligand_id,
+        "ligand_smiles": ligand_input.smiles,
+        "mapping_index": int(mapping_index),
+        "ligand_core_match": [int(x) for x in ligand_core_match],
+        "reference_core_smarts": cfg["inputs"]["reference_core_smarts"],
+        "ligand_core_smarts": query_smarts,
+        "file_hashes": file_hashes,
+    }
+    docking_payload = {
+        "base": base,
+        "box": cfg["box"],
+        "docking": cfg["docking"],
+        "constraints": cfg["constraints"],
+        "runtime": _to_serializable_cfg_subset(cfg["runtime"], ["exhaustiveness", "num_modes"]),
+    }
+    docking_key = _stable_hash(docking_payload)
+
+    optimization_payload = {
+        "docking_key": docking_key,
+        "optimization": cfg["optimization"],
+        "constraints": cfg["constraints"],
+    }
+    optimization_key = _stable_hash(optimization_payload)
+
+    scoring_payload = {
+        "optimization_key": optimization_key,
+        "rescoring": cfg["rescoring"],
+        "outputs": _to_serializable_cfg_subset(cfg["outputs"], ["top_n"]),
+        "primary_scorer": cfg["docking"]["primary_scorer"],
+    }
+    scoring_key = _stable_hash(scoring_payload)
+    return {
+        "docking": docking_key,
+        "optimization": optimization_key,
+        "scoring": scoring_key,
+    }
+
+
+def _serialize_cnfrs(cnfrs: list[torch.Tensor]) -> list[torch.Tensor]:
+    return [torch.tensor(c.detach().cpu().numpy(), dtype=torch.float32) for c in cnfrs]
+
+
+def _load_cached_cnfrs(stage_dir: str, stage: str, expected_key: str) -> list[torch.Tensor] | None:
+    meta_path = os.path.join(stage_dir, f"{stage}.meta.yaml")
+    data_path = os.path.join(stage_dir, f"{stage}.pt")
+    meta = _safe_yaml_load(meta_path)
+    if not meta or meta.get("stage_key") != expected_key:
+        return None
+    payload = _safe_torch_load(data_path)
+    if not isinstance(payload, dict):
+        return None
+    vals = payload.get("cnfrs")
+    if not isinstance(vals, list):
+        return None
+    out: list[torch.Tensor] = []
+    for v in vals:
+        if not isinstance(v, torch.Tensor):
+            return None
+        out.append(torch.tensor(v.detach().cpu().numpy(), dtype=torch.float32))
+    return out
+
+
+def _save_cached_cnfrs(stage_dir: str, stage: str, stage_key: str, cnfrs: list[torch.Tensor]) -> None:
+    _ensure_dir(stage_dir)
+    meta_path = os.path.join(stage_dir, f"{stage}.meta.yaml")
+    data_path = os.path.join(stage_dir, f"{stage}.pt")
+    _atomic_torch_save({"cnfrs": _serialize_cnfrs(cnfrs)}, data_path)
+    _atomic_yaml_dump({"stage_key": stage_key, "count": len(cnfrs)}, meta_path)
+
+
+def _load_cached_scores(stage_dir: str, expected_key: str) -> list[dict[str, float]] | None:
+    meta_path = os.path.join(stage_dir, "scoring.meta.yaml")
+    data_path = os.path.join(stage_dir, "scoring.yaml")
+    meta = _safe_yaml_load(meta_path)
+    if not meta or meta.get("stage_key") != expected_key:
+        return None
+    payload = _safe_yaml_load(data_path)
+    if not payload:
+        return None
+    rows = payload.get("pose_records")
+    if not isinstance(rows, list):
+        return None
+    parsed: list[dict[str, float]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        try:
+            parsed.append(
+                {
+                    "primary": float(row["primary"]),
+                    "rescore": float(row["rescore"]),
+                    "core_rmsd": float(row["core_rmsd"]),
+                }
+            )
+        except Exception:
+            return None
+    return parsed
+
+
+def _save_cached_scores(stage_dir: str, stage_key: str, pose_records: list[dict[str, Any]]) -> None:
+    _ensure_dir(stage_dir)
+    meta_path = os.path.join(stage_dir, "scoring.meta.yaml")
+    data_path = os.path.join(stage_dir, "scoring.yaml")
+    serializable = []
+    for row in pose_records:
+        serializable.append(
+            {
+                "primary": float(row["primary"]),
+                "rescore": float(row["rescore"]),
+                "core_rmsd": float(row["core_rmsd"]),
+            }
+        )
+    _atomic_yaml_dump({"pose_records": serializable}, data_path)
+    _atomic_yaml_dump({"stage_key": stage_key, "count": len(serializable)}, meta_path)
+
+
+def _write_stage_pose_snapshot(lig_pdbqt: str, cnfrs: list[torch.Tensor], out_sdf: str, box_center: list[float]) -> None:
+    if not cnfrs:
+        return
+    _ensure_dir(os.path.dirname(out_sdf))
+    lig = LigandConformation(lig_pdbqt)
+    lig.ligand_center[0][0] = box_center[0]
+    lig.ligand_center[0][1] = box_center[1]
+    lig.ligand_center[0][2] = box_center[2]
+    tmp_pdbqt = out_sdf.replace(".sdf", ".pdbqt")
+    write_ligand_traj(cnfrs, lig, tmp_pdbqt, information={})
+    _to_pdbqt(tmp_pdbqt, out_sdf)
+
+
 def _post_optimize(
     cnfrs: list[torch.Tensor],
     ligand: LigandConformation,
@@ -484,10 +678,14 @@ def _dock_with_mapping(
     lig_rdkit: Chem.Mol,
     template_core_match: tuple[int, ...],
     ligand_core_match: tuple[int, ...],
+    mapping_index: int,
     template_core_xyz: np.ndarray,
     anchor_rec_indices: list[int],
     anchor_ref_distances: list[float],
-) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    cache_stage_dir: str,
+    stage_keys: dict[str, str],
+    reuse_enabled: bool,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any], dict[str, Any]]:
     box_center = np.mean(template_core_xyz, axis=0).tolist()
     box_size = [float(x) for x in cfg["box"]["size"]]
 
@@ -553,46 +751,94 @@ def _dock_with_mapping(
     init_rec_cnfrs = receptor.init_cnfrs
     ligand.cnfrs_, receptor.cnfrs_ = sampler._random_move(init_lig_cnfrs, init_rec_cnfrs)
 
-    if sampler_name == "ga":
-        sampler.sampling(n_gen=max(2, nsteps // 100), verbose=False)
-    elif sampler_name == "bo":
-        sampler.sampling(n_iter=max(10, nsteps // 100), init_points=5)
-    else:
-        sampler.sampling(nsteps=nsteps)
+    reuse_info = {
+        "mapping_index": int(mapping_index),
+        "reused_docking": False,
+        "reused_optimization": False,
+        "reused_scoring": False,
+        "notes": [],
+    }
 
-    if not sampler.ligand_cnfrs_history_:
-        raise RuntimeError("Sampling finished without collected conformations")
-
-    cluster = BaseCluster(
-        sampler.ligand_cnfrs_history_,
-        None,
-        sampler.ligand_scores_history_,
-        ligand,
-        1,
-    )
-    _, clustered_cnfrs, _ = cluster.clustering(num_modes=int(cfg["runtime"]["num_modes"]))
+    clustered_cnfrs = None
+    if reuse_enabled:
+        clustered_cnfrs = _load_cached_cnfrs(cache_stage_dir, "docking", stage_keys["docking"])
+        if clustered_cnfrs:
+            reuse_info["reused_docking"] = True
+            reuse_info["notes"].append("reused:docking")
     if not clustered_cnfrs:
-        raise RuntimeError("No clustered poses generated")
+        if sampler_name == "ga":
+            sampler.sampling(n_gen=max(2, nsteps // 100), verbose=False)
+        elif sampler_name == "bo":
+            sampler.sampling(n_iter=max(10, nsteps // 100), init_points=5)
+        else:
+            sampler.sampling(nsteps=nsteps)
+
+        if not sampler.ligand_cnfrs_history_:
+            raise RuntimeError("Sampling finished without collected conformations")
+
+        cluster = BaseCluster(
+            sampler.ligand_cnfrs_history_,
+            None,
+            sampler.ligand_scores_history_,
+            ligand,
+            1,
+        )
+        _, clustered_cnfrs, _ = cluster.clustering(num_modes=int(cfg["runtime"]["num_modes"]))
+        if not clustered_cnfrs:
+            raise RuntimeError("No clustered poses generated")
+        _save_cached_cnfrs(cache_stage_dir, "docking", stage_keys["docking"], clustered_cnfrs)
+        _write_stage_pose_snapshot(
+            lig_pdbqt=lig_pdbqt,
+            cnfrs=clustered_cnfrs,
+            out_sdf=os.path.join(cache_stage_dir, "docking_poses.sdf"),
+            box_center=box_center,
+        )
 
     optimized_cnfrs = clustered_cnfrs
     if opt_cfg.get("enabled", False):
-        opt_primary_name = opt_cfg.get("scorer") or primary_name
-        opt_primary_scorer = PRIMARY_SCORERS[opt_primary_name](receptor=receptor, ligand=ligand)
-        scoring_for_optimization: BaseScoringFunction = opt_primary_scorer
-        if core_cfg.get("enabled", False) and rest_scorer is not None:
-            scoring_for_optimization = HybridSF(
-                receptor=receptor,
-                ligand=ligand,
-                scorers=[opt_primary_scorer, rest_scorer],
-                weights=[1.0, float(core_cfg.get("weight", 0.0))],
+        cached_optimized = None
+        if reuse_enabled:
+            cached_optimized = _load_cached_cnfrs(cache_stage_dir, "optimization", stage_keys["optimization"])
+            if cached_optimized and len(cached_optimized) == len(clustered_cnfrs):
+                optimized_cnfrs = cached_optimized
+                reuse_info["reused_optimization"] = True
+                reuse_info["notes"].append("reused:optimization")
+            else:
+                cached_optimized = None
+
+        if cached_optimized is None:
+            opt_primary_name = opt_cfg.get("scorer") or primary_name
+            opt_primary_scorer = PRIMARY_SCORERS[opt_primary_name](receptor=receptor, ligand=ligand)
+            scoring_for_optimization: BaseScoringFunction = opt_primary_scorer
+            if core_cfg.get("enabled", False) and rest_scorer is not None:
+                scoring_for_optimization = HybridSF(
+                    receptor=receptor,
+                    ligand=ligand,
+                    scorers=[opt_primary_scorer, rest_scorer],
+                    weights=[1.0, float(core_cfg.get("weight", 0.0))],
+                )
+            optimized_cnfrs = _post_optimize(
+                clustered_cnfrs,
+                ligand,
+                scoring_for_optimization,
+                opt_cfg["minimizer"],
+                int(opt_cfg["steps"]),
+                float(opt_cfg["lr"]),
             )
-        optimized_cnfrs = _post_optimize(
-            clustered_cnfrs,
-            ligand,
-            scoring_for_optimization,
-            opt_cfg["minimizer"],
-            int(opt_cfg["steps"]),
-            float(opt_cfg["lr"]),
+            _save_cached_cnfrs(cache_stage_dir, "optimization", stage_keys["optimization"], optimized_cnfrs)
+            _write_stage_pose_snapshot(
+                lig_pdbqt=lig_pdbqt,
+                cnfrs=optimized_cnfrs,
+                out_sdf=os.path.join(cache_stage_dir, "optimization_poses.sdf"),
+                box_center=box_center,
+            )
+    else:
+        _save_cached_cnfrs(cache_stage_dir, "optimization", stage_keys["optimization"], optimized_cnfrs)
+        _write_stage_pose_snapshot(
+            lig_pdbqt=lig_pdbqt,
+            cnfrs=optimized_cnfrs,
+            out_sdf=os.path.join(cache_stage_dir, "optimization_poses.sdf"),
+            box_center=box_center,
         )
 
     rescoring_cfg = cfg["rescoring"]
@@ -607,25 +853,42 @@ def _dock_with_mapping(
             rescoring_error = f"rescoring_disabled: {exc}"
 
     pose_records = []
-    for cnfr in optimized_cnfrs:
-        primary_val = _score_conformation(ligand, receptor, primary_scorer, cnfr)
-        rec_val = primary_val
-        if rescoring_scorer is not None:
-            try:
-                rec_val = _score_conformation(ligand, receptor, rescoring_scorer, cnfr)
-            except Exception as exc:
-                rec_val = primary_val
-                if not rescoring_error:
-                    rescoring_error = f"rescoring_failed: {exc}"
+    cached_scores = None
+    if reuse_enabled:
+        cached_scores = _load_cached_scores(cache_stage_dir, stage_keys["scoring"])
+        if cached_scores and len(cached_scores) == len(optimized_cnfrs):
+            for i, s in enumerate(cached_scores):
+                pose_records.append(
+                    {
+                        "cnfr": optimized_cnfrs[i],
+                        "primary": float(s["primary"]),
+                        "rescore": float(s["rescore"]),
+                        "core_rmsd": float(s["core_rmsd"]),
+                    }
+                )
+            reuse_info["reused_scoring"] = True
+            reuse_info["notes"].append("reused:scoring")
+    if not pose_records:
+        for cnfr in optimized_cnfrs:
+            primary_val = _score_conformation(ligand, receptor, primary_scorer, cnfr)
+            rec_val = primary_val
+            if rescoring_scorer is not None:
+                try:
+                    rec_val = _score_conformation(ligand, receptor, rescoring_scorer, cnfr)
+                except Exception as exc:
+                    rec_val = primary_val
+                    if not rescoring_error:
+                        rescoring_error = f"rescoring_failed: {exc}"
 
-        pose_records.append(
-            {
-                "cnfr": cnfr,
-                "primary": primary_val,
-                "rescore": rec_val,
-                "core_rmsd": _core_rmsd_for_pose(ligand, cnfr, lig_core_od_indices, template_core_xyz),
-            }
-        )
+            pose_records.append(
+                {
+                    "cnfr": cnfr,
+                    "primary": primary_val,
+                    "rescore": rec_val,
+                    "core_rmsd": _core_rmsd_for_pose(ligand, cnfr, lig_core_od_indices, template_core_xyz),
+                }
+            )
+        _save_cached_scores(cache_stage_dir, stage_keys["scoring"], pose_records)
 
     ranked = _rank_pose_records(pose_records, use_rescore)
     top_n = int(cfg["outputs"]["top_n"])
@@ -650,7 +913,9 @@ def _dock_with_mapping(
         force_constant=float(core_cfg["force_constant"]),
         weight=float(core_cfg.get("weight", 0.0)),
     )
-    return selected, rescoring_error, manifest
+    if not reuse_info["notes"] and reuse_enabled:
+        reuse_info["notes"].append("recompute:all_stages")
+    return selected, rescoring_error, manifest, reuse_info
 
 
 def _run_single_ligand(
@@ -662,8 +927,11 @@ def _run_single_ligand(
     anchor_ref_distances: list[float],
     ligand_input: LigandInput,
     work_dir: str,
+    cache_dir: str,
     poses_dir: str,
     manifests_dir: str,
+    file_hashes: dict[str, str],
+    reuse_enabled: bool,
 ) -> dict[str, Any]:
     ligand_id = _sanitize_id(ligand_input.ligand_id)
     ligand_work = os.path.join(work_dir, ligand_id)
@@ -690,6 +958,7 @@ def _run_single_ligand(
     best_selected_records = None
     best_error_note = ""
     best_manifest: dict[str, Any] | None = None
+    best_reuse_info: dict[str, Any] | None = None
     last_mapping_error = ""
 
     for map_idx, match in enumerate(selected_matches):
@@ -697,16 +966,28 @@ def _run_single_ligand(
             continue
 
         try:
-            selected_records, mapping_error, mapping_manifest = _dock_with_mapping(
+            stage_keys = _build_stage_keys(
+                cfg=cfg,
+                ligand_input=ligand_input,
+                ligand_core_match=match,
+                mapping_index=map_idx,
+                file_hashes=file_hashes,
+            )
+            mapping_cache_dir = os.path.join(cache_dir, ligand_id, f"map_{map_idx:03d}")
+            selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
                 cfg=cfg,
                 receptor_pdbqt=receptor_pdbqt,
                 lig_pdbqt=lig_pdbqt,
                 lig_rdkit=lig_rdkit,
                 template_core_match=template_core_match,
                 ligand_core_match=match,
+                mapping_index=map_idx,
                 template_core_xyz=template_core_xyz,
                 anchor_rec_indices=anchor_rec_indices,
                 anchor_ref_distances=anchor_ref_distances,
+                cache_stage_dir=mapping_cache_dir,
+                stage_keys=stage_keys,
+                reuse_enabled=reuse_enabled,
             )
         except Exception as exc:
             last_mapping_error = str(exc)
@@ -722,6 +1003,7 @@ def _run_single_ligand(
             best_selected_records = selected_records
             best_error_note = mapping_error
             best_manifest = mapping_manifest
+            best_reuse_info = reuse_info
 
     if best_selected_records is None:
         if last_mapping_error:
@@ -760,6 +1042,13 @@ def _run_single_ligand(
     best_manifest["mappings_tested"] = len(selected_matches)
     best_manifest["mappings_total"] = len(query_matches)
     best_manifest["mappings_truncated"] = bool(truncated)
+    if best_reuse_info:
+        best_manifest["reuse"] = {
+            "reused_docking": bool(best_reuse_info.get("reused_docking", False)),
+            "reused_optimization": bool(best_reuse_info.get("reused_optimization", False)),
+            "reused_scoring": bool(best_reuse_info.get("reused_scoring", False)),
+            "reuse_note": ",".join(best_reuse_info.get("notes", [])),
+        }
     with open(manifest_path, "w", encoding="utf-8") as tf:
         yaml.safe_dump(best_manifest, tf, sort_keys=False)
 
@@ -771,6 +1060,9 @@ def _run_single_ligand(
         )
     if best_error_note:
         error_messages.append(best_error_note)
+    reuse_note = ""
+    if best_reuse_info and best_reuse_info.get("notes"):
+        reuse_note = ",".join(best_reuse_info["notes"])
 
     return {
         "ligand_id": ligand_id,
@@ -785,6 +1077,10 @@ def _run_single_ligand(
         "mappings_total": len(query_matches),
         "mappings_truncated": str(truncated).lower(),
         "mapping_manifest": manifest_path,
+        "reused_docking": str(bool(best_reuse_info and best_reuse_info.get("reused_docking", False))).lower(),
+        "reused_optimization": str(bool(best_reuse_info and best_reuse_info.get("reused_optimization", False))).lower(),
+        "reused_scoring": str(bool(best_reuse_info and best_reuse_info.get("reused_scoring", False))).lower(),
+        "reuse_note": reuse_note,
         "error": " | ".join(error_messages),
     }
 
@@ -806,14 +1102,22 @@ def run_from_config(config_path: str) -> None:
 
     output_dir = os.path.abspath(cfg["outputs"]["dir"])
     work_dir = os.path.join(output_dir, "work")
+    cache_dir = os.path.join(work_dir, "cache")
     poses_dir = os.path.join(output_dir, "poses")
     manifests_dir = os.path.join(output_dir, "manifests")
     _ensure_dir(output_dir)
     _ensure_dir(work_dir)
+    _ensure_dir(cache_dir)
     _ensure_dir(poses_dir)
     _ensure_dir(manifests_dir)
+    reuse_enabled = bool(cfg["runtime"].get("reuse_enabled", True))
 
     receptor_input = cfg["inputs"].get("receptor_pdbqt") or cfg["inputs"].get("receptor_pdb")
+    file_hashes = {
+        "receptor_input": _sha256_file(receptor_input),
+        "reference_core_sdf": _sha256_file(cfg["inputs"]["reference_core_sdf"]),
+        "ligands_smiles": _sha256_file(cfg["inputs"]["ligands_smiles"]),
+    }
     receptor_pdbqt = _prepare_receptor(receptor_input, work_dir)
     _, template_core_match, template_core_xyz = _load_reference_template(
         cfg["inputs"]["reference_core_sdf"],
@@ -835,8 +1139,11 @@ def run_from_config(config_path: str) -> None:
                 anchor_ref_distances=anchor_ref_distances,
                 ligand_input=lig,
                 work_dir=work_dir,
+                cache_dir=cache_dir,
                 poses_dir=poses_dir,
                 manifests_dir=manifests_dir,
+                file_hashes=file_hashes,
+                reuse_enabled=reuse_enabled,
             )
         except Exception as exc:
             row = {
@@ -852,6 +1159,10 @@ def run_from_config(config_path: str) -> None:
                 "mappings_total": 0,
                 "mappings_truncated": "false",
                 "mapping_manifest": "",
+                "reused_docking": "false",
+                "reused_optimization": "false",
+                "reused_scoring": "false",
+                "reuse_note": "",
                 "error": str(exc),
             }
         rows.append(row)
@@ -870,6 +1181,10 @@ def run_from_config(config_path: str) -> None:
         "mappings_total",
         "mappings_truncated",
         "mapping_manifest",
+        "reused_docking",
+        "reused_optimization",
+        "reused_scoring",
+        "reuse_note",
         "error",
     ]
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
