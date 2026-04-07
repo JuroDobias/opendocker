@@ -42,6 +42,13 @@ constraints:
     template_constrained_embed: true
     template_constrained_embed_max_attempts: 20
     rigid_prealign: true
+    init_conformers:
+      enabled: false
+      n_confs: 50
+      rmsd_threshold: 0.5
+      max_output_conformers: null
+      embed_max_attempts: 0
+      embed_seed: 1234
     # deprecated/ignored in distance-restraint mode:
     # max_core_rmsd: 2.0
 

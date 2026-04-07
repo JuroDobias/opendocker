@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdMolAlign
 from rdkit.Geometry import Point3D
 
 from opendock.core.clustering import BaseCluster
@@ -238,6 +238,16 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         core.setdefault("template_constrained_embed", True)
         core.setdefault("template_constrained_embed_max_attempts", 20)
         core.setdefault("rigid_prealign", True)
+        core.setdefault("init_conformers", {})
+        init_cf = core["init_conformers"]
+        if not isinstance(init_cf, dict):
+            raise ValueError("constraints.core.init_conformers must be a mapping")
+        init_cf.setdefault("enabled", False)
+        init_cf.setdefault("n_confs", 50)
+        init_cf.setdefault("rmsd_threshold", 0.5)
+        init_cf.setdefault("max_output_conformers", None)
+        init_cf.setdefault("embed_max_attempts", 0)
+        init_cf.setdefault("embed_seed", 1234)
         if float(core["tolerance"]) < 0:
             raise ValueError("constraints.core.tolerance must be >= 0")
         if float(core["force_constant"]) < 0:
@@ -246,6 +256,14 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("constraints.core.max_query_mappings must be >= 1")
         if int(core["template_constrained_embed_max_attempts"]) < 1:
             raise ValueError("constraints.core.template_constrained_embed_max_attempts must be >= 1")
+        if int(init_cf["n_confs"]) < 1:
+            raise ValueError("constraints.core.init_conformers.n_confs must be >= 1")
+        if float(init_cf["rmsd_threshold"]) < 0:
+            raise ValueError("constraints.core.init_conformers.rmsd_threshold must be >= 0")
+        if int(init_cf["embed_max_attempts"]) < 0:
+            raise ValueError("constraints.core.init_conformers.embed_max_attempts must be >= 0")
+        if init_cf["max_output_conformers"] is not None and int(init_cf["max_output_conformers"]) < 1:
+            raise ValueError("constraints.core.init_conformers.max_output_conformers must be >= 1")
 
     _must_get(runtime, "exhaustiveness")
     _must_get(runtime, "num_modes")
@@ -474,6 +492,145 @@ def _constrained_embed_rdkit_to_template_core(
         return mol, False, f"constrained_embed_failed:{exc}"
 
 
+def _single_conformer_copy(mol: Chem.Mol, conf_id: int) -> Chem.Mol:
+    out = Chem.Mol(mol)
+    conf = out.GetConformer(int(conf_id))
+    new_conf = Chem.Conformer(conf)
+    out.RemoveAllConformers()
+    out.AddConformer(new_conf, assignId=True)
+    return out
+
+
+def _embed_multiple_with_coord_map(
+    mol: Chem.Mol,
+    coord_map: dict[int, Point3D],
+    n_confs: int,
+    seed: int,
+    max_attempts: int,
+) -> tuple[list[int], Chem.Mol]:
+    work = Chem.Mol(mol)
+    work.RemoveAllConformers()
+    kwargs = {
+        "numConfs": int(n_confs),
+        "randomSeed": int(seed),
+        "clearConfs": True,
+        "coordMap": coord_map,
+        "useRandomCoords": False,
+    }
+    if int(max_attempts) > 0:
+        kwargs["maxAttempts"] = int(max_attempts)
+    try:
+        conf_ids = list(AllChem.EmbedMultipleConfs(work, **kwargs))
+        if conf_ids:
+            return conf_ids, work
+    except Exception:
+        pass
+
+    # Robust fallback for RDKit builds with limited EmbedMultipleConfs kwargs support.
+    work = Chem.Mol(mol)
+    work.RemoveAllConformers()
+    conf_ids = []
+    for i in range(int(n_confs)):
+        per_seed = int(seed) + i
+        try:
+            if int(max_attempts) > 0:
+                status = AllChem.EmbedMolecule(
+                    work,
+                    maxAttempts=int(max_attempts),
+                    randomSeed=per_seed,
+                    clearConfs=False,
+                    coordMap=coord_map,
+                    useRandomCoords=False,
+                )
+            else:
+                status = AllChem.EmbedMolecule(
+                    work,
+                    randomSeed=per_seed,
+                    clearConfs=False,
+                    coordMap=coord_map,
+                    useRandomCoords=False,
+                )
+            if int(status) == 0:
+                conf_ids.append(work.GetNumConformers() - 1)
+        except Exception:
+            continue
+    return conf_ids, work
+
+
+def _greedy_rmsd_filter(mol: Chem.Mol, conf_ids: list[int], rmsd_threshold: float, max_keep: int | None) -> list[int]:
+    heavy_idxs = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    # Keep atom identity fixed and ignore hydrogens for diversity filtering.
+    heavy_map = [[(int(i), int(i)) for i in heavy_idxs]] if heavy_idxs else None
+
+    kept: list[int] = []
+    for cid in conf_ids:
+        if not kept:
+            kept.append(int(cid))
+        else:
+            keep_this = True
+            for k in kept:
+                try:
+                    if heavy_map:
+                        rms = float(rdMolAlign.GetBestRMS(mol, mol, int(cid), int(k), map=heavy_map))
+                    else:
+                        rms = float(AllChem.GetConformerRMS(mol, int(cid), int(k), prealigned=False))
+                except Exception:
+                    rms = 0.0
+                if rms < float(rmsd_threshold):
+                    keep_this = False
+                    break
+            if keep_this:
+                kept.append(int(cid))
+        if max_keep is not None and len(kept) >= int(max_keep):
+            break
+    return kept
+
+
+def _generate_mapping_init_conformers(
+    map_lig_rdkit: Chem.Mol,
+    ligand_core_match: tuple[int, ...],
+    template_core_xyz: np.ndarray,
+    conf_cfg: dict[str, Any],
+) -> tuple[list[Chem.Mol], dict[str, Any], str]:
+    if not bool(conf_cfg.get("enabled", False)):
+        return [Chem.Mol(map_lig_rdkit)], {"generated_count": 1, "kept_count": 1}, ""
+
+    coord_map: dict[int, Point3D] = {}
+    for i, atom_idx in enumerate(ligand_core_match):
+        xyz = template_core_xyz[i]
+        coord_map[int(atom_idx)] = Point3D(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+    conf_ids, work = _embed_multiple_with_coord_map(
+        map_lig_rdkit,
+        coord_map,
+        int(conf_cfg.get("n_confs", 50)),
+        int(conf_cfg.get("embed_seed", 1234)),
+        int(conf_cfg.get("embed_max_attempts", 0)),
+    )
+    if not conf_ids:
+        return [Chem.Mol(map_lig_rdkit)], {"generated_count": 0, "kept_count": 1}, "init_conformers_failed:no_embedded_confs"
+
+    max_keep_val = conf_cfg.get("max_output_conformers")
+    max_keep = int(max_keep_val) if max_keep_val is not None else None
+    kept_ids = _greedy_rmsd_filter(
+        work,
+        conf_ids,
+        float(conf_cfg.get("rmsd_threshold", 0.5)),
+        max_keep,
+    )
+    if not kept_ids:
+        return [Chem.Mol(map_lig_rdkit)], {"generated_count": len(conf_ids), "kept_count": 1}, "init_conformers_failed:all_filtered_by_rmsd"
+
+    out_mols = [_single_conformer_copy(work, cid) for cid in kept_ids]
+    info = {
+        "generated_count": int(len(conf_ids)),
+        "kept_count": int(len(out_mols)),
+        "rmsd_threshold": float(conf_cfg.get("rmsd_threshold", 0.5)),
+        "max_output_conformers": max_keep_val,
+    }
+    return out_mols, info, ""
+
+
 def _load_reference_template(reference_sdf: str, reference_smarts: str) -> tuple[Chem.Mol, tuple[int, ...], np.ndarray]:
     suppl = Chem.SDMolSupplier(reference_sdf, removeHs=False)
     ref_mol = next((m for m in suppl if m is not None), None)
@@ -577,6 +734,7 @@ def _build_stage_keys(
     ligand_input: LigandInput,
     ligand_core_match: tuple[int, ...],
     mapping_index: int,
+    conformer_index: int,
     file_hashes: dict[str, str],
 ) -> dict[str, str]:
     query_smarts = cfg["inputs"].get("ligand_core_smarts") or cfg["inputs"]["reference_core_smarts"]
@@ -584,6 +742,7 @@ def _build_stage_keys(
         "ligand_id": ligand_input.ligand_id,
         "ligand_smiles": ligand_input.smiles,
         "mapping_index": int(mapping_index),
+        "conformer_index": int(conformer_index),
         "ligand_core_match": [int(x) for x in ligand_core_match],
         "reference_core_smarts": cfg["inputs"]["reference_core_smarts"],
         "ligand_core_smarts": query_smarts,
@@ -1105,6 +1264,7 @@ def _run_single_ligand(
     best_manifest: dict[str, Any] | None = None
     best_reuse_info: dict[str, Any] | None = None
     best_init_info: dict[str, Any] | None = None
+    best_conformer_index: int | None = None
     best_input_pdbqt: str | None = None
     last_mapping_error = ""
 
@@ -1135,56 +1295,83 @@ def _run_single_ligand(
                     init_method = "constrained_embed+rigid"
                 else:
                     init_method = "rigid"
-            prepared_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.sdf")
-            map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.pdbqt")
-            _write_rdkit_sdf(map_lig_rdkit, prepared_sdf)
-            _to_pdbqt(prepared_sdf, map_lig_pdbqt)
-
-            stage_keys = _build_stage_keys(
-                cfg=cfg,
-                ligand_input=ligand_input,
+            init_conf_cfg = core_cfg.get("init_conformers", {}) or {}
+            variant_mols, conf_info, conf_warn = _generate_mapping_init_conformers(
+                map_lig_rdkit=map_lig_rdkit,
                 ligand_core_match=match,
-                mapping_index=map_idx,
-                file_hashes=file_hashes,
-            )
-            mapping_cache_dir = os.path.join(cache_dir, ligand_id, f"map_{map_idx:03d}")
-            selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
-                cfg=cfg,
-                receptor_pdbqt=receptor_pdbqt,
-                lig_pdbqt=map_lig_pdbqt,
-                lig_rdkit=map_lig_rdkit,
-                template_core_match=template_core_match,
-                ligand_core_match=match,
-                mapping_index=map_idx,
                 template_core_xyz=template_core_xyz,
-                anchor_rec_indices=anchor_rec_indices,
-                anchor_ref_distances=anchor_ref_distances,
-                cache_stage_dir=mapping_cache_dir,
-                stage_keys=stage_keys,
-                reuse_enabled=reuse_enabled,
+                conf_cfg=init_conf_cfg,
             )
+
+            for conf_idx, conf_mol in enumerate(variant_mols):
+                run_mol = conf_mol
+                if bool(core_cfg.get("rigid_prealign", True)):
+                    run_mol = _rigid_align_rdkit_to_template_core(run_mol, match, template_core_xyz)
+
+                prepared_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.sdf")
+                map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.pdbqt")
+                _write_rdkit_sdf(run_mol, prepared_sdf)
+                _to_pdbqt(prepared_sdf, map_lig_pdbqt)
+                if conf_idx == 0:
+                    primary_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.sdf")
+                    primary_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.pdbqt")
+                    shutil.copyfile(prepared_sdf, primary_sdf)
+                    shutil.copyfile(map_lig_pdbqt, primary_pdbqt)
+
+                stage_keys = _build_stage_keys(
+                    cfg=cfg,
+                    ligand_input=ligand_input,
+                    ligand_core_match=match,
+                    mapping_index=map_idx,
+                    conformer_index=conf_idx,
+                    file_hashes=file_hashes,
+                )
+                mapping_cache_dir = os.path.join(cache_dir, ligand_id, f"map_{map_idx:03d}", f"conf_{conf_idx:03d}")
+                selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
+                    cfg=cfg,
+                    receptor_pdbqt=receptor_pdbqt,
+                    lig_pdbqt=map_lig_pdbqt,
+                    lig_rdkit=run_mol,
+                    template_core_match=template_core_match,
+                    ligand_core_match=match,
+                    mapping_index=map_idx,
+                    template_core_xyz=template_core_xyz,
+                    anchor_rec_indices=anchor_rec_indices,
+                    anchor_ref_distances=anchor_ref_distances,
+                    cache_stage_dir=mapping_cache_dir,
+                    stage_keys=stage_keys,
+                    reuse_enabled=reuse_enabled,
+                )
+
+                if not selected_records:
+                    continue
+
+                mapping_primary = min(float(x["primary"]) for x in selected_records)
+                if best_primary is None or mapping_primary < best_primary:
+                    best_primary = mapping_primary
+                    best_mapping_index = map_idx
+                    best_conformer_index = conf_idx
+                    best_selected_records = selected_records
+                    best_error_note = mapping_error
+                    best_manifest = mapping_manifest
+                    best_reuse_info = reuse_info
+                    best_init_info = {
+                        "method": init_method,
+                        "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
+                        "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
+                        "warning": " | ".join([x for x in [init_warning, conf_warn] if x]),
+                        "init_conformers": {
+                            "enabled": bool(init_conf_cfg.get("enabled", False)),
+                            "generated_count": int(conf_info.get("generated_count", len(variant_mols))),
+                            "kept_count": int(conf_info.get("kept_count", len(variant_mols))),
+                            "rmsd_threshold": float(init_conf_cfg.get("rmsd_threshold", 0.5)),
+                            "max_output_conformers": init_conf_cfg.get("max_output_conformers"),
+                        },
+                    }
+                    best_input_pdbqt = map_lig_pdbqt
         except Exception as exc:
             last_mapping_error = str(exc)
             continue
-
-        if not selected_records:
-            continue
-
-        mapping_primary = min(float(x["primary"]) for x in selected_records)
-        if best_primary is None or mapping_primary < best_primary:
-            best_primary = mapping_primary
-            best_mapping_index = map_idx
-            best_selected_records = selected_records
-            best_error_note = mapping_error
-            best_manifest = mapping_manifest
-            best_reuse_info = reuse_info
-            best_init_info = {
-                "method": init_method,
-                "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
-                "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
-                "warning": init_warning,
-            }
-            best_input_pdbqt = map_lig_pdbqt
 
     if best_selected_records is None:
         if last_mapping_error:
@@ -1221,6 +1408,7 @@ def _run_single_ligand(
     best_manifest["ligand_id"] = ligand_id
     best_manifest["smiles"] = ligand_input.smiles
     best_manifest["mapping_index"] = int(best_mapping_index) if best_mapping_index is not None else None
+    best_manifest["conformer_index"] = int(best_conformer_index) if best_conformer_index is not None else None
     best_manifest["mappings_tested"] = len(selected_matches)
     best_manifest["mappings_total"] = len(query_matches)
     best_manifest["mappings_truncated"] = bool(truncated)
@@ -1259,6 +1447,7 @@ def _run_single_ligand(
         "core_rmsd": best["core_rmsd"],
         "pose_sdf": out_sdf,
         "mapping_index": best_mapping_index,
+        "conformer_index": best_conformer_index if best_conformer_index is not None else "",
         "mappings_tested": len(selected_matches),
         "mappings_total": len(query_matches),
         "mappings_truncated": str(truncated).lower(),
@@ -1341,6 +1530,7 @@ def run_from_config(config_path: str) -> None:
                 "core_rmsd": np.nan,
                 "pose_sdf": "",
                 "mapping_index": "",
+                "conformer_index": "",
                 "mappings_tested": 0,
                 "mappings_total": 0,
                 "mappings_truncated": "false",
@@ -1363,6 +1553,7 @@ def run_from_config(config_path: str) -> None:
         "core_rmsd",
         "pose_sdf",
         "mapping_index",
+        "conformer_index",
         "mappings_tested",
         "mappings_total",
         "mappings_truncated",
