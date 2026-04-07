@@ -557,23 +557,35 @@ def _embed_multiple_with_coord_map(
     return conf_ids, work
 
 
-def _greedy_rmsd_filter(mol: Chem.Mol, conf_ids: list[int], rmsd_threshold: float, max_keep: int | None) -> list[int]:
-    heavy_idxs = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
-    # Keep atom identity fixed and ignore hydrogens for diversity filtering.
-    heavy_map = [[(int(i), int(i)) for i in heavy_idxs]] if heavy_idxs else None
+def _symmetry_aware_heavy_rms(mol_a: Chem.Mol, mol_b: Chem.Mol) -> float:
+    """RMSD on heavy atoms with symmetry handling, without mutating inputs."""
+    prb = Chem.Mol(mol_a)
+    ref = Chem.Mol(mol_b)
+    try:
+        prb = Chem.RemoveHs(prb)
+    except Exception:
+        pass
+    try:
+        ref = Chem.RemoveHs(ref)
+    except Exception:
+        pass
+    # GetBestRMS aligns probe internally, so always use fresh copies.
+    return float(rdMolAlign.GetBestRMS(Chem.Mol(prb), Chem.Mol(ref), prbId=0, refId=0))
 
+
+def _greedy_rmsd_filter(mol: Chem.Mol, conf_ids: list[int], rmsd_threshold: float, max_keep: int | None) -> list[int]:
     kept: list[int] = []
+    kept_mols: list[Chem.Mol] = []
     for cid in conf_ids:
+        candidate = _single_conformer_copy(mol, int(cid))
         if not kept:
             kept.append(int(cid))
+            kept_mols.append(candidate)
         else:
             keep_this = True
-            for k in kept:
+            for kept_mol in kept_mols:
                 try:
-                    if heavy_map:
-                        rms = float(rdMolAlign.GetBestRMS(mol, mol, int(cid), int(k), map=heavy_map))
-                    else:
-                        rms = float(AllChem.GetConformerRMS(mol, int(cid), int(k), prealigned=False))
+                    rms = _symmetry_aware_heavy_rms(candidate, kept_mol)
                 except Exception:
                     rms = 0.0
                 if rms < float(rmsd_threshold):
@@ -581,9 +593,34 @@ def _greedy_rmsd_filter(mol: Chem.Mol, conf_ids: list[int], rmsd_threshold: floa
                     break
             if keep_this:
                 kept.append(int(cid))
+                kept_mols.append(candidate)
         if max_keep is not None and len(kept) >= int(max_keep):
             break
     return kept
+
+
+def _merge_unique_candidates_by_rmsd(
+    accepted: list[dict[str, Any]],
+    new_candidates: list[dict[str, Any]],
+    rmsd_threshold: float,
+) -> tuple[list[dict[str, Any]], int]:
+    merged = list(accepted)
+    removed = 0
+    for cand in new_candidates:
+        duplicate = False
+        for kept in merged:
+            try:
+                rms = _symmetry_aware_heavy_rms(cand["mol"], kept["mol"])
+            except Exception:
+                rms = 0.0
+            if rms < float(rmsd_threshold):
+                duplicate = True
+                break
+        if duplicate:
+            removed += 1
+        else:
+            merged.append(cand)
+    return merged, removed
 
 
 def _generate_mapping_init_conformers(
@@ -1268,6 +1305,14 @@ def _run_single_ligand(
     best_input_pdbqt: str | None = None
     last_mapping_error = ""
 
+    init_conf_cfg = core_cfg.get("init_conformers", {}) or {}
+    dedup_rmsd_threshold = float(init_conf_cfg.get("rmsd_threshold", 0.5))
+    generated_total = 0
+    mapping_local_kept_total = 0
+    dedup_removed_total = 0
+    candidate_pool: list[dict[str, Any]] = []
+    candidate_sources: list[dict[str, int]] = []
+
     for map_idx, match in enumerate(selected_matches):
         if len(match) != len(template_core_xyz):
             continue
@@ -1295,83 +1340,110 @@ def _run_single_ligand(
                     init_method = "constrained_embed+rigid"
                 else:
                     init_method = "rigid"
-            init_conf_cfg = core_cfg.get("init_conformers", {}) or {}
+
             variant_mols, conf_info, conf_warn = _generate_mapping_init_conformers(
                 map_lig_rdkit=map_lig_rdkit,
                 ligand_core_match=match,
                 template_core_xyz=template_core_xyz,
                 conf_cfg=init_conf_cfg,
             )
+            generated_total += int(conf_info.get("generated_count", len(variant_mols)))
+            mapping_local_kept_total += int(conf_info.get("kept_count", len(variant_mols)))
 
+            map_candidates: list[dict[str, Any]] = []
             for conf_idx, conf_mol in enumerate(variant_mols):
                 run_mol = conf_mol
                 if bool(core_cfg.get("rigid_prealign", True)):
                     run_mol = _rigid_align_rdkit_to_template_core(run_mol, match, template_core_xyz)
-
-                prepared_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.sdf")
-                map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.pdbqt")
-                _write_rdkit_sdf(run_mol, prepared_sdf)
-                _to_pdbqt(prepared_sdf, map_lig_pdbqt)
-                if conf_idx == 0:
-                    primary_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.sdf")
-                    primary_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.pdbqt")
-                    shutil.copyfile(prepared_sdf, primary_sdf)
-                    shutil.copyfile(map_lig_pdbqt, primary_pdbqt)
-
-                stage_keys = _build_stage_keys(
-                    cfg=cfg,
-                    ligand_input=ligand_input,
-                    ligand_core_match=match,
-                    mapping_index=map_idx,
-                    conformer_index=conf_idx,
-                    file_hashes=file_hashes,
-                )
-                mapping_cache_dir = os.path.join(cache_dir, ligand_id, f"map_{map_idx:03d}", f"conf_{conf_idx:03d}")
-                selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
-                    cfg=cfg,
-                    receptor_pdbqt=receptor_pdbqt,
-                    lig_pdbqt=map_lig_pdbqt,
-                    lig_rdkit=run_mol,
-                    template_core_match=template_core_match,
-                    ligand_core_match=match,
-                    mapping_index=map_idx,
-                    template_core_xyz=template_core_xyz,
-                    anchor_rec_indices=anchor_rec_indices,
-                    anchor_ref_distances=anchor_ref_distances,
-                    cache_stage_dir=mapping_cache_dir,
-                    stage_keys=stage_keys,
-                    reuse_enabled=reuse_enabled,
-                )
-
-                if not selected_records:
-                    continue
-
-                mapping_primary = min(float(x["primary"]) for x in selected_records)
-                if best_primary is None or mapping_primary < best_primary:
-                    best_primary = mapping_primary
-                    best_mapping_index = map_idx
-                    best_conformer_index = conf_idx
-                    best_selected_records = selected_records
-                    best_error_note = mapping_error
-                    best_manifest = mapping_manifest
-                    best_reuse_info = reuse_info
-                    best_init_info = {
-                        "method": init_method,
-                        "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
-                        "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
-                        "warning": " | ".join([x for x in [init_warning, conf_warn] if x]),
-                        "init_conformers": {
-                            "enabled": bool(init_conf_cfg.get("enabled", False)),
-                            "generated_count": int(conf_info.get("generated_count", len(variant_mols))),
-                            "kept_count": int(conf_info.get("kept_count", len(variant_mols))),
-                            "rmsd_threshold": float(init_conf_cfg.get("rmsd_threshold", 0.5)),
-                            "max_output_conformers": init_conf_cfg.get("max_output_conformers"),
+                map_candidates.append(
+                    {
+                        "mapping_index": map_idx,
+                        "conformer_index": conf_idx,
+                        "ligand_core_match": match,
+                        "mol": run_mol,
+                        "initialization": {
+                            "method": init_method,
+                            "constrained_embed_enabled": bool(core_cfg.get("template_constrained_embed", True)),
+                            "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
+                            "warning": " | ".join([x for x in [init_warning, conf_warn] if x]),
+                            "init_conformers": {
+                                "enabled": bool(init_conf_cfg.get("enabled", False)),
+                                "generated_count": int(conf_info.get("generated_count", len(variant_mols))),
+                                "kept_count": int(conf_info.get("kept_count", len(variant_mols))),
+                                "rmsd_threshold": float(init_conf_cfg.get("rmsd_threshold", 0.5)),
+                                "max_output_conformers": init_conf_cfg.get("max_output_conformers"),
+                            },
                         },
                     }
-                    best_input_pdbqt = map_lig_pdbqt
+                )
+
+            merged, removed = _merge_unique_candidates_by_rmsd(
+                accepted=candidate_pool,
+                new_candidates=map_candidates,
+                rmsd_threshold=dedup_rmsd_threshold,
+            )
+            candidate_pool = merged
+            dedup_removed_total += int(removed)
         except Exception as exc:
             last_mapping_error = str(exc)
             continue
+
+    for cand in candidate_pool:
+        map_idx = int(cand["mapping_index"])
+        conf_idx = int(cand["conformer_index"])
+        match = tuple(int(x) for x in cand["ligand_core_match"])
+        run_mol = cand["mol"]
+
+        prepared_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.sdf")
+        map_lig_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.conf_{conf_idx:03d}.prepared.pdbqt")
+        _write_rdkit_sdf(run_mol, prepared_sdf)
+        _to_pdbqt(prepared_sdf, map_lig_pdbqt)
+        candidate_sources.append({"mapping_index": int(map_idx), "conformer_index": int(conf_idx)})
+        if conf_idx == 0:
+            primary_sdf = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.sdf")
+            primary_pdbqt = os.path.join(ligand_work, f"{ligand_id}.map_{map_idx:03d}.prepared.pdbqt")
+            shutil.copyfile(prepared_sdf, primary_sdf)
+            shutil.copyfile(map_lig_pdbqt, primary_pdbqt)
+
+        stage_keys = _build_stage_keys(
+            cfg=cfg,
+            ligand_input=ligand_input,
+            ligand_core_match=match,
+            mapping_index=map_idx,
+            conformer_index=conf_idx,
+            file_hashes=file_hashes,
+        )
+        mapping_cache_dir = os.path.join(cache_dir, ligand_id, f"map_{map_idx:03d}", f"conf_{conf_idx:03d}")
+        selected_records, mapping_error, mapping_manifest, reuse_info = _dock_with_mapping(
+            cfg=cfg,
+            receptor_pdbqt=receptor_pdbqt,
+            lig_pdbqt=map_lig_pdbqt,
+            lig_rdkit=run_mol,
+            template_core_match=template_core_match,
+            ligand_core_match=match,
+            mapping_index=map_idx,
+            template_core_xyz=template_core_xyz,
+            anchor_rec_indices=anchor_rec_indices,
+            anchor_ref_distances=anchor_ref_distances,
+            cache_stage_dir=mapping_cache_dir,
+            stage_keys=stage_keys,
+            reuse_enabled=reuse_enabled,
+        )
+
+        if not selected_records:
+            continue
+
+        mapping_primary = min(float(x["primary"]) for x in selected_records)
+        if best_primary is None or mapping_primary < best_primary:
+            best_primary = mapping_primary
+            best_mapping_index = map_idx
+            best_conformer_index = conf_idx
+            best_selected_records = selected_records
+            best_error_note = mapping_error
+            best_manifest = mapping_manifest
+            best_reuse_info = reuse_info
+            best_init_info = cand.get("initialization")
+            best_input_pdbqt = map_lig_pdbqt
 
     if best_selected_records is None:
         if last_mapping_error:
@@ -1412,6 +1484,15 @@ def _run_single_ligand(
     best_manifest["mappings_tested"] = len(selected_matches)
     best_manifest["mappings_total"] = len(query_matches)
     best_manifest["mappings_truncated"] = bool(truncated)
+    best_manifest["candidate_dedup"] = {
+        "rmsd_metric": "symmetry_aware_heavy_atom_rmsd",
+        "rmsd_threshold": float(dedup_rmsd_threshold),
+        "generated_total": int(generated_total),
+        "mapping_local_kept_total": int(mapping_local_kept_total),
+        "unique_candidates": int(len(candidate_pool)),
+        "duplicates_removed": int(dedup_removed_total),
+        "accepted_candidates": candidate_sources,
+    }
     if best_init_info:
         best_manifest["initialization"] = best_init_info
     if best_reuse_info:
