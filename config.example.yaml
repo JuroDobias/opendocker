@@ -1,0 +1,43 @@
+inputs:
+  receptor_pdb: /absolute/path/receptor.pdb
+  ligands_smiles: /absolute/path/ligands.smi
+  reference_core_sdf: /absolute/path/reference_ligand.sdf
+  reference_core_smarts: "c1ccccc1"
+  ligand_core_smarts: null
+
+box:
+  mode: from_reference_ligand
+  size: [20.0, 20.0, 20.0]
+
+docking:
+  primary_scorer: vina
+  sampler: mc
+
+optimization:
+  enabled: true
+  minimizer: lbfgs
+  steps: 25
+  lr: 0.05
+
+rescoring:
+  enabled: true
+  scorer: deeprmsd
+
+constraints:
+  core:
+    enabled: true
+    weight: 0.5
+    tolerance: 0.5
+    force_constant: 1.0
+    max_query_mappings: 16
+    # deprecated/ignored in distance-restraint mode:
+    # max_core_rmsd: 2.0
+
+runtime:
+  exhaustiveness: 8
+  num_modes: 20
+  threads: 1
+
+outputs:
+  dir: ./output
+  top_n: 5

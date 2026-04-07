@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opendocker"
+version = "0.1.0"
+description = "YAML-driven docking wrapper around OpenDock"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "PyYAML",
+]
+
+[project.scripts]
+opendocker = "opendocker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["opendocker*"]
