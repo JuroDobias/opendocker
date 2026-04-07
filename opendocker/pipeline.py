@@ -634,7 +634,7 @@ def _run_single_ligand(
     if patt is None:
         raise ValueError("Invalid ligand core SMARTS")
 
-    query_matches = list(lig_rdkit.GetSubstructMatches(patt))
+    query_matches = list(lig_rdkit.GetSubstructMatches(patt, uniquify=False))
     if not query_matches:
         raise ValueError("No SMARTS match found in query ligand")
 
