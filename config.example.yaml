@@ -18,6 +18,9 @@ docking:
 
 optimization:
   enabled: true
+  # optional: override scorer used in optimization stage only
+  # (default is docking.primary_scorer)
+  scorer: deeprmsd
   minimizer: lbfgs
   steps: 25
   lr: 0.05

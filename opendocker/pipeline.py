@@ -193,6 +193,9 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "optimization.minimizer='none' is not supported by this OpenDock build for sampling; use one of: lbfgs, adam, sgd"
         )
+    opt_scorer = optimization.get("scorer")
+    if opt_scorer is not None and opt_scorer not in PRIMARY_SCORERS:
+        raise ValueError(f"Unsupported optimization.scorer: {opt_scorer}")
 
     rescore_name = _must_get(rescoring, "scorer")
     if rescoring.get("enabled", False) and rescore_name not in RESCORERS:
@@ -391,7 +394,7 @@ def _core_rmsd_for_pose(ligand: LigandConformation, cnfr: torch.Tensor, ligand_c
 def _post_optimize(
     cnfrs: list[torch.Tensor],
     ligand: LigandConformation,
-    scoring_for_sampling: BaseScoringFunction,
+    scoring_function: BaseScoringFunction,
     minimizer_name: str,
     steps: int,
     lr: float,
@@ -406,7 +409,7 @@ def _post_optimize(
 
         def _target(v):
             ligand.cnfr2xyz(v)
-            return torch.sum(scoring_for_sampling.scoring())
+            return torch.sum(scoring_function.scoring())
 
         new_x = minimizer(x, _target, nsteps=int(steps), lr=float(lr))
         optimized.append(new_x[0].detach())
@@ -510,6 +513,7 @@ def _dock_with_mapping(
     primary_scorer = PRIMARY_SCORERS[primary_name](receptor=receptor, ligand=ligand)
 
     core_cfg = cfg["constraints"]["core"]
+    rest_scorer: AnchorDistanceRestraintSF | None = None
     scoring_for_sampling: BaseScoringFunction = primary_scorer
     if core_cfg.get("enabled", False):
         rest_scorer = AnchorDistanceRestraintSF(
@@ -572,10 +576,20 @@ def _dock_with_mapping(
 
     optimized_cnfrs = clustered_cnfrs
     if opt_cfg.get("enabled", False):
+        opt_primary_name = opt_cfg.get("scorer") or primary_name
+        opt_primary_scorer = PRIMARY_SCORERS[opt_primary_name](receptor=receptor, ligand=ligand)
+        scoring_for_optimization: BaseScoringFunction = opt_primary_scorer
+        if core_cfg.get("enabled", False) and rest_scorer is not None:
+            scoring_for_optimization = HybridSF(
+                receptor=receptor,
+                ligand=ligand,
+                scorers=[opt_primary_scorer, rest_scorer],
+                weights=[1.0, float(core_cfg.get("weight", 0.0))],
+            )
         optimized_cnfrs = _post_optimize(
             clustered_cnfrs,
             ligand,
-            scoring_for_sampling,
+            scoring_for_optimization,
             opt_cfg["minimizer"],
             int(opt_cfg["steps"]),
             float(opt_cfg["lr"]),
@@ -779,6 +793,8 @@ def run_from_config(config_path: str) -> None:
     cfg = _load_config(config_path)
 
     requested_scorers = {cfg["docking"]["primary_scorer"]}
+    if cfg.get("optimization", {}).get("scorer"):
+        requested_scorers.add(cfg["optimization"]["scorer"])
     if cfg["rescoring"].get("enabled", False):
         requested_scorers.add(cfg["rescoring"]["scorer"])
     if {"deeprmsd", "rmsd-vina"} & requested_scorers:
