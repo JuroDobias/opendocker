@@ -13,6 +13,7 @@ box:
   size: [20.0, 20.0, 20.0]
 
 docking:
+  enabled: true
   primary_scorer: vina
   sampler: mc
 
@@ -21,6 +22,8 @@ optimization:
   # optional: override scorer used in optimization stage only
   # (default is docking.primary_scorer)
   scorer: deeprmsd
+  # default true when docking.enabled=false, else false
+  freeze_rigid_body: false
   minimizer: lbfgs
   steps: 25
   lr: 0.05

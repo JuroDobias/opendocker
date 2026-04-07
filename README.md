@@ -47,6 +47,8 @@ Current core constraint is based on template-derived ligand-protein distance res
 `config.yaml` controls receptor input, SMILES batch, scorer/sampler, optimization, rescoring, and constraint parameters.
 By default, runs reuse cached intermediate stages in `outputs.dir/work/cache` when relevant settings and input file contents are unchanged.
 Set `runtime.reuse_enabled: false` to force full recomputation.
+Set `docking.enabled: false` to skip sampling/docking and run only optimization/rescoring from the prepared input pose.
+When `docking.enabled: false`, optimization defaults to `freeze_rigid_body: true` so only internal torsions are optimized.
 
 For receptor input you can use either:
 - `inputs.receptor_pdbqt` (preferred, no conversion)

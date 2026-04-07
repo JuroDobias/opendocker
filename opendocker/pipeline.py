@@ -200,11 +200,15 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("box.size must have 3 elements")
 
     primary = _must_get(docking, "primary_scorer")
-    sampler = _must_get(docking, "sampler")
+    docking.setdefault("enabled", True)
     if primary not in PRIMARY_SCORERS:
         raise ValueError(f"Unsupported docking.primary_scorer: {primary}")
-    if sampler not in SAMPLERS:
-        raise ValueError(f"Unsupported docking.sampler: {sampler}")
+    if bool(docking.get("enabled", True)):
+        sampler = _must_get(docking, "sampler")
+        if sampler not in SAMPLERS:
+            raise ValueError(f"Unsupported docking.sampler: {sampler}")
+    else:
+        docking.setdefault("sampler", "mc")
 
     min_name = _must_get(optimization, "minimizer")
     if min_name not in MINIMIZERS:
@@ -216,6 +220,8 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     opt_scorer = optimization.get("scorer")
     if opt_scorer is not None and opt_scorer not in PRIMARY_SCORERS:
         raise ValueError(f"Unsupported optimization.scorer: {opt_scorer}")
+    if "freeze_rigid_body" not in optimization:
+        optimization["freeze_rigid_body"] = not bool(docking.get("enabled", True))
 
     rescore_name = _must_get(rescoring, "scorer")
     if rescoring.get("enabled", False) and rescore_name not in RESCORERS:
@@ -690,6 +696,7 @@ def _post_optimize(
     minimizer_name: str,
     steps: int,
     lr: float,
+    freeze_rigid_body: bool = False,
 ) -> list[torch.Tensor]:
     minimizer = MINIMIZERS[minimizer_name]
     if minimizer is None:
@@ -697,14 +704,27 @@ def _post_optimize(
 
     optimized = []
     for cnfr in cnfrs:
-        x = [torch.tensor(cnfr.detach().numpy(), dtype=torch.float32).requires_grad_()]
+        cnfr_tensor = torch.tensor(cnfr.detach().numpy(), dtype=torch.float32)
+        if freeze_rigid_body and cnfr_tensor.ndim == 2 and cnfr_tensor.shape[1] > 6:
+            fixed_head = cnfr_tensor[:, :6].detach()
+            x = [cnfr_tensor[:, 6:].detach().clone().requires_grad_()]
 
-        def _target(v):
-            ligand.cnfr2xyz(v)
-            return torch.sum(scoring_function.scoring())
+            def _target(v):
+                merged = torch.cat([fixed_head, v[0]], dim=1)
+                ligand.cnfr2xyz([merged])
+                return torch.sum(scoring_function.scoring())
 
-        new_x = minimizer(x, _target, nsteps=int(steps), lr=float(lr))
-        optimized.append(new_x[0].detach())
+            new_tail = minimizer(x, _target, nsteps=int(steps), lr=float(lr))[0].detach()
+            optimized.append(torch.cat([fixed_head, new_tail], dim=1).detach())
+        else:
+            x = [cnfr_tensor.requires_grad_()]
+
+            def _target(v):
+                ligand.cnfr2xyz(v)
+                return torch.sum(scoring_function.scoring())
+
+            new_x = minimizer(x, _target, nsteps=int(steps), lr=float(lr))
+            optimized.append(new_x[0].detach())
     return optimized
 
 
@@ -828,26 +848,9 @@ def _dock_with_mapping(
             weights=[1.0, float(core_cfg.get("weight", 0.0))],
         )
 
+    docking_enabled = bool(cfg["docking"].get("enabled", True))
     sampler_name = cfg["docking"]["sampler"]
-    sampler_cls = SAMPLERS[sampler_name]
-    step_factor = SAMPLER_STEP_FACTOR[sampler_name]
-    nsteps = int(cfg["runtime"]["exhaustiveness"]) * step_factor * int(ligand.number_of_heavy_atoms)
-
     opt_cfg = cfg["optimization"]
-    sampler_minimizer = MINIMIZERS[opt_cfg["minimizer"]]
-    sampler = sampler_cls(
-        ligand,
-        receptor,
-        scoring_for_sampling,
-        box_center=box_center,
-        box_size=box_size,
-        random_start=True,
-        minimizer=sampler_minimizer,
-    )
-
-    init_lig_cnfrs = [torch.tensor(ligand.init_cnfrs.detach().numpy())]
-    init_rec_cnfrs = receptor.init_cnfrs
-    ligand.cnfrs_, receptor.cnfrs_ = sampler._random_move(init_lig_cnfrs, init_rec_cnfrs)
 
     reuse_info = {
         "mapping_index": int(mapping_index),
@@ -864,26 +867,48 @@ def _dock_with_mapping(
             reuse_info["reused_docking"] = True
             reuse_info["notes"].append("reused:docking")
     if not clustered_cnfrs:
-        if sampler_name == "ga":
-            sampler.sampling(n_gen=max(2, nsteps // 100), verbose=False)
-        elif sampler_name == "bo":
-            sampler.sampling(n_iter=max(10, nsteps // 100), init_points=5)
+        if docking_enabled:
+            sampler_cls = SAMPLERS[sampler_name]
+            step_factor = SAMPLER_STEP_FACTOR[sampler_name]
+            nsteps = int(cfg["runtime"]["exhaustiveness"]) * step_factor * int(ligand.number_of_heavy_atoms)
+            sampler_minimizer = MINIMIZERS[opt_cfg["minimizer"]]
+            sampler = sampler_cls(
+                ligand,
+                receptor,
+                scoring_for_sampling,
+                box_center=box_center,
+                box_size=box_size,
+                random_start=True,
+                minimizer=sampler_minimizer,
+            )
+
+            init_lig_cnfrs = [torch.tensor(ligand.init_cnfrs.detach().numpy())]
+            init_rec_cnfrs = receptor.init_cnfrs
+            ligand.cnfrs_, receptor.cnfrs_ = sampler._random_move(init_lig_cnfrs, init_rec_cnfrs)
+
+            if sampler_name == "ga":
+                sampler.sampling(n_gen=max(2, nsteps // 100), verbose=False)
+            elif sampler_name == "bo":
+                sampler.sampling(n_iter=max(10, nsteps // 100), init_points=5)
+            else:
+                sampler.sampling(nsteps=nsteps)
+
+            if not sampler.ligand_cnfrs_history_:
+                raise RuntimeError("Sampling finished without collected conformations")
+
+            cluster = BaseCluster(
+                sampler.ligand_cnfrs_history_,
+                None,
+                sampler.ligand_scores_history_,
+                ligand,
+                1,
+            )
+            _, clustered_cnfrs, _ = cluster.clustering(num_modes=int(cfg["runtime"]["num_modes"]))
+            if not clustered_cnfrs:
+                raise RuntimeError("No clustered poses generated")
         else:
-            sampler.sampling(nsteps=nsteps)
-
-        if not sampler.ligand_cnfrs_history_:
-            raise RuntimeError("Sampling finished without collected conformations")
-
-        cluster = BaseCluster(
-            sampler.ligand_cnfrs_history_,
-            None,
-            sampler.ligand_scores_history_,
-            ligand,
-            1,
-        )
-        _, clustered_cnfrs, _ = cluster.clustering(num_modes=int(cfg["runtime"]["num_modes"]))
-        if not clustered_cnfrs:
-            raise RuntimeError("No clustered poses generated")
+            clustered_cnfrs = [torch.tensor(ligand.init_cnfrs.detach().numpy(), dtype=torch.float32)]
+            reuse_info["notes"].append("docking_disabled:using_prepared_input")
         _save_cached_cnfrs(cache_stage_dir, "docking", stage_keys["docking"], clustered_cnfrs)
         _write_stage_pose_snapshot(
             lig_pdbqt=lig_pdbqt,
@@ -922,6 +947,7 @@ def _dock_with_mapping(
                 opt_cfg["minimizer"],
                 int(opt_cfg["steps"]),
                 float(opt_cfg["lr"]),
+                bool(opt_cfg.get("freeze_rigid_body", False)),
             )
             _save_cached_cnfrs(cache_stage_dir, "optimization", stage_keys["optimization"], optimized_cnfrs)
             _write_stage_pose_snapshot(
@@ -1058,6 +1084,7 @@ def _run_single_ligand(
     best_manifest: dict[str, Any] | None = None
     best_reuse_info: dict[str, Any] | None = None
     best_init_info: dict[str, Any] | None = None
+    best_input_pdbqt: str | None = None
     last_mapping_error = ""
 
     for map_idx, match in enumerate(selected_matches):
@@ -1136,6 +1163,7 @@ def _run_single_ligand(
                 "constrained_embed_success": bool(init_method.startswith("constrained_embed")),
                 "warning": init_warning,
             }
+            best_input_pdbqt = map_lig_pdbqt
 
     if best_selected_records is None:
         if last_mapping_error:
@@ -1145,7 +1173,8 @@ def _run_single_ligand(
     best_cnfrs = [x["cnfr"] for x in best_selected_records]
 
     # Rebuild ligand object for trajectory export from selected conformations.
-    export_ligand = LigandConformation(lig_pdbqt)
+    export_pdbqt = best_input_pdbqt or lig_pdbqt
+    export_ligand = LigandConformation(export_pdbqt)
     box_center = np.mean(template_core_xyz, axis=0).tolist()
     export_ligand.ligand_center[0][0] = box_center[0]
     export_ligand.ligand_center[0][1] = box_center[1]
