@@ -2,23 +2,32 @@
 
 YAML-driven docking wrapper around OpenDock.
 
-## Option 1: repo-local command (no install)
+## Installation (Conda)
+
+Create environment from [`enviroment.yaml`](enviroment.yaml):
 
 ```bash
-export PATH="$(pwd)/bin:$PATH"
-opendocker run -c config.yaml
-```
-
-## Option 2: install CLI into env
-
-```bash
+git clone https://github.com/JuroDobias/opendocker.git
+git clone https://github.com/guyuehuo/opendock.git
+cd opendocker
+conda env create -f enviroment.yaml
+conda activate opendocker
+pip install -e ../opendock --no-build-isolation
 pip install -e . --no-build-isolation
 ```
 
-Then run:
+## Run
 
 ```bash
 opendocker run -c config.yaml
+```
+
+## Run without install (optional)
+
+```bash
+python -m opendocker run -c config.yaml
+# or
+./bin/opendocker run -c config.yaml
 ```
 
 ## Core Constraint Mode
