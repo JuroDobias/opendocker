@@ -818,6 +818,11 @@ def _write_pose_records_sdf(
     writer = Chem.SDWriter(out_sdf)
     for row in pose_records:
         mol = Chem.Mol(row["pose_mol"])
+        try:
+            if any(a.GetAtomicNum() == 1 for a in mol.GetAtoms()):
+                mol = Chem.AddHs(Chem.RemoveHs(mol), addCoords=True)
+        except Exception:
+            pass
         mol.SetProp(f"primary_{primary_name}", str(float(row["primary"])))
         mol.SetProp("rescore", str(float(row["rescore"])))
         mol.SetProp("core_rmsd", str(float(row["core_rmsd"])))
