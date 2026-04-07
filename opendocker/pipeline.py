@@ -14,6 +14,7 @@ import torch
 import yaml
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Geometry import Point3D
 
 from opendock.core.clustering import BaseCluster
 from opendock.core.conformation import LigandConformation, ReceptorConformation
@@ -423,6 +424,27 @@ def _constrained_embed_rdkit_to_template_core(
     if len(ligand_core_match) != int(template_core_xyz.shape[0]):
         return mol, False, "constrained_embed_failed:core_atom_count_mismatch"
 
+    # Mapping-aware constrained embedding using explicit coordMap.
+    # This preserves alternative SMARTS mappings for symmetric cores.
+    mapped = Chem.Mol(mol)
+    coord_map = {}
+    for i, atom_idx in enumerate(ligand_core_match):
+        xyz = template_core_xyz[i]
+        coord_map[int(atom_idx)] = Point3D(float(xyz[0]), float(xyz[1]), float(xyz[2]))
+
+    status = AllChem.EmbedMolecule(
+        mapped,
+        maxAttempts=int(max_attempts),
+        randomSeed=0xC0DE,
+        clearConfs=True,
+        coordMap=coord_map,
+        useRandomCoords=False,
+    )
+    if status == 0:
+        return mapped, True, ""
+
+    # Fallback for environments where coordMap embedding may fail.
+    # This may collapse symmetric mappings, but keeps the run robust.
     # Build a query-derived core submolecule and place its atoms at template-core coordinates.
     idx_map: dict[int, int] = {}
     rw = Chem.RWMol()
@@ -439,7 +461,6 @@ def _constrained_embed_rdkit_to_template_core(
         xyz = template_core_xyz[i]
         core_conf.SetAtomPosition(i, (float(xyz[0]), float(xyz[1]), float(xyz[2])))
     core.AddConformer(core_conf, assignId=True)
-
     try:
         embedded = AllChem.ConstrainedEmbed(
             Chem.Mol(mol),
@@ -448,7 +469,7 @@ def _constrained_embed_rdkit_to_template_core(
             randomseed=0xC0DE,
             useTethers=True,
         )
-        return embedded, True, ""
+        return embedded, True, "constrained_embed_warning:coordMap_failed_used_ConstrainedEmbed"
     except Exception as exc:
         return mol, False, f"constrained_embed_failed:{exc}"
 
