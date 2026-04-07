@@ -36,6 +36,10 @@ Current core constraint is based on template-derived ligand-protein distance res
 
 `config.yaml` controls receptor input, SMILES batch, scorer/sampler, optimization, rescoring, and constraint parameters.
 
+For receptor input you can use either:
+- `inputs.receptor_pdbqt` (preferred, no conversion)
+- `inputs.receptor_pdb` (converted to PDBQT)
+
 See `config.example.yaml` for the schema.
 
 ## Notes

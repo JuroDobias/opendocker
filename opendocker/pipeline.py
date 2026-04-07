@@ -141,7 +141,9 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     runtime = _must_get(cfg, "runtime")
     outputs = _must_get(cfg, "outputs")
 
-    for k in ["receptor_pdb", "ligands_smiles", "reference_core_sdf", "reference_core_smarts"]:
+    if "receptor_pdbqt" not in inputs and "receptor_pdb" not in inputs:
+        raise ValueError("inputs must include either receptor_pdbqt or receptor_pdb")
+    for k in ["ligands_smiles", "reference_core_sdf", "reference_core_smarts"]:
         _must_get(inputs, k)
 
     if box.get("mode") != "from_reference_ligand":
@@ -227,11 +229,10 @@ def _to_pdbqt(input_path: str, output_path: str) -> None:
 
 
 def _prepare_receptor(receptor_path: str, work_dir: str) -> str:
-    rec_out = os.path.join(work_dir, "receptor.pdbqt")
     if receptor_path.lower().endswith(".pdbqt"):
-        shutil.copyfile(receptor_path, rec_out)
-    else:
-        _to_pdbqt(receptor_path, rec_out)
+        return os.path.abspath(receptor_path)
+    rec_out = os.path.join(work_dir, "receptor.pdbqt")
+    _to_pdbqt(receptor_path, rec_out)
     return rec_out
 
 
@@ -762,7 +763,8 @@ def run_from_config(config_path: str) -> None:
     _ensure_dir(poses_dir)
     _ensure_dir(manifests_dir)
 
-    receptor_pdbqt = _prepare_receptor(cfg["inputs"]["receptor_pdb"], work_dir)
+    receptor_input = cfg["inputs"].get("receptor_pdbqt") or cfg["inputs"].get("receptor_pdb")
+    receptor_pdbqt = _prepare_receptor(receptor_input, work_dir)
     _, template_core_match, template_core_xyz = _load_reference_template(
         cfg["inputs"]["reference_core_sdf"],
         cfg["inputs"]["reference_core_smarts"],

@@ -1,4 +1,7 @@
 inputs:
+  # Use receptor_pdbqt for fastest startup (no conversion).
+  receptor_pdbqt: /absolute/path/receptor.pdbqt
+  # Optional alternative:
   receptor_pdb: /absolute/path/receptor.pdb
   ligands_smiles: /absolute/path/ligands.smi
   reference_core_sdf: /absolute/path/reference_ligand.sdf
