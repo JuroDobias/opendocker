@@ -38,10 +38,12 @@ Current core constraint is based on template-derived ligand-protein distance res
 - match SMARTS on query ligand; try up to `max_query_mappings` query matches
 - initialize each mapping from template-guided geometry (`template_constrained_embed`) with rigid core pre-alignment (`rigid_prealign`)
 - optional RDKit multi-conformer initialization with greedy RMSD filtering (`constraints.core.init_conformers`) per mapping
+- merge all accepted mapping/conformer candidates into a global pose pool
 - for each mapping, apply flat-bottom quadratic restraint with:
   - `tolerance` (half-width)
   - `force_constant` (penalty strength)
-- select best mapping by primary docking score
+- rank poses globally across all candidates and keep `outputs.top_n`
+- optional final global symmetry-aware heavy-atom RMSD filtering (`outputs.final_rmsd_filter`)
 
 ## Inputs
 

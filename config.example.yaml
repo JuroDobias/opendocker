@@ -61,3 +61,6 @@ runtime:
 outputs:
   dir: ./output
   top_n: 5
+  final_rmsd_filter:
+    enabled: false
+    threshold: 0.5

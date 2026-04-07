@@ -270,6 +270,14 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     runtime.setdefault("reuse_enabled", True)
     _must_get(outputs, "dir")
     _must_get(outputs, "top_n")
+    outputs.setdefault("final_rmsd_filter", {})
+    frf = outputs["final_rmsd_filter"]
+    if not isinstance(frf, dict):
+        raise ValueError("outputs.final_rmsd_filter must be a mapping")
+    frf.setdefault("enabled", False)
+    frf.setdefault("threshold", 0.5)
+    if float(frf["threshold"]) < 0:
+        raise ValueError("outputs.final_rmsd_filter.threshold must be >= 0")
 
     return cfg
 
@@ -762,6 +770,65 @@ def _core_rmsd_for_pose(ligand: LigandConformation, cnfr: torch.Tensor, ligand_c
     return float(rmsd)
 
 
+def _pose_mol_from_cnfr(
+    ligand: LigandConformation,
+    lig_rdkit: Chem.Mol,
+    rd_to_od: dict[int, int],
+    cnfr: torch.Tensor,
+) -> Chem.Mol:
+    ligand.cnfr2xyz([cnfr])
+    od_xyz = ligand.pose_heavy_atoms_coords[0].detach().numpy()
+    out = Chem.Mol(lig_rdkit)
+    conf = out.GetConformer()
+    for rd_idx, od_idx in rd_to_od.items():
+        p = od_xyz[int(od_idx)]
+        conf.SetAtomPosition(int(rd_idx), (float(p[0]), float(p[1]), float(p[2])))
+    return out
+
+
+def _filter_ranked_records_by_global_rmsd(
+    ranked_records: list[dict[str, Any]],
+    rmsd_threshold: float,
+) -> tuple[list[dict[str, Any]], int]:
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for row in ranked_records:
+        duplicate = False
+        for k in kept:
+            try:
+                rms = _symmetry_aware_heavy_rms(row["pose_mol"], k["pose_mol"])
+            except Exception:
+                rms = 0.0
+            if rms < float(rmsd_threshold):
+                duplicate = True
+                break
+        if duplicate:
+            removed += 1
+        else:
+            kept.append(row)
+    return kept, removed
+
+
+def _write_pose_records_sdf(
+    pose_records: list[dict[str, Any]],
+    out_sdf: str,
+    primary_name: str,
+) -> None:
+    _ensure_dir(os.path.dirname(out_sdf))
+    writer = Chem.SDWriter(out_sdf)
+    for row in pose_records:
+        mol = Chem.Mol(row["pose_mol"])
+        mol.SetProp(f"primary_{primary_name}", str(float(row["primary"])))
+        mol.SetProp("rescore", str(float(row["rescore"])))
+        mol.SetProp("core_rmsd", str(float(row["core_rmsd"])))
+        if "mapping_index" in row:
+            mol.SetProp("mapping_index", str(int(row["mapping_index"])))
+        if "conformer_index" in row:
+            mol.SetProp("conformer_index", str(int(row["conformer_index"])))
+        writer.write(mol)
+    writer.close()
+
+
 def _to_serializable_cfg_subset(cfg: dict[str, Any], keys: list[str]) -> dict[str, Any]:
     return {k: cfg[k] for k in keys if k in cfg}
 
@@ -1193,18 +1260,20 @@ def _dock_with_mapping(
             rescoring_scorer = None
             rescoring_error = f"rescoring_disabled: {exc}"
 
-    pose_records = []
+    pose_records: list[dict[str, Any]] = []
     cached_scores = None
     if reuse_enabled:
         cached_scores = _load_cached_scores(cache_stage_dir, stage_keys["scoring"])
         if cached_scores and len(cached_scores) == len(optimized_cnfrs):
             for i, s in enumerate(cached_scores):
+                cnfr = optimized_cnfrs[i]
                 pose_records.append(
                     {
-                        "cnfr": optimized_cnfrs[i],
+                        "cnfr": cnfr,
                         "primary": float(s["primary"]),
                         "rescore": float(s["rescore"]),
                         "core_rmsd": float(s["core_rmsd"]),
+                        "pose_mol": _pose_mol_from_cnfr(ligand, lig_rdkit, rd_to_od, cnfr),
                     }
                 )
             reuse_info["reused_scoring"] = True
@@ -1227,13 +1296,13 @@ def _dock_with_mapping(
                     "primary": primary_val,
                     "rescore": rec_val,
                     "core_rmsd": _core_rmsd_for_pose(ligand, cnfr, lig_core_od_indices, template_core_xyz),
+                    "pose_mol": _pose_mol_from_cnfr(ligand, lig_rdkit, rd_to_od, cnfr),
                 }
             )
         _save_cached_scores(cache_stage_dir, stage_keys["scoring"], pose_records)
 
     ranked = _rank_pose_records(pose_records, use_rescore)
-    top_n = int(cfg["outputs"]["top_n"])
-    selected = ranked[:top_n]
+    selected = ranked
 
     best_pose_distances: list[float] = []
     if selected:
@@ -1294,16 +1363,8 @@ def _run_single_ligand(
     selected_matches = query_matches[:max_query_mappings]
     truncated = len(query_matches) > len(selected_matches)
 
-    best_mapping_index = None
-    best_primary = None
-    best_selected_records = None
-    best_error_note = ""
-    best_manifest: dict[str, Any] | None = None
-    best_reuse_info: dict[str, Any] | None = None
-    best_init_warning = ""
-    best_conformer_index: int | None = None
-    best_input_pdbqt: str | None = None
     last_mapping_error = ""
+    global_pose_records: list[dict[str, Any]] = []
 
     init_conf_cfg = core_cfg.get("init_conformers", {}) or {}
     init_conf_cfg_per_map = dict(init_conf_cfg)
@@ -1431,46 +1492,53 @@ def _run_single_ligand(
         if not selected_records:
             continue
 
-        mapping_primary = min(float(x["primary"]) for x in selected_records)
-        if best_primary is None or mapping_primary < best_primary:
-            best_primary = mapping_primary
-            best_mapping_index = map_idx
-            best_conformer_index = conf_idx
-            best_selected_records = selected_records
-            best_error_note = mapping_error
-            best_manifest = mapping_manifest
-            best_reuse_info = reuse_info
-            best_init_warning = str(cand.get("init_warning", "") or "")
-            best_input_pdbqt = map_lig_pdbqt
+        for rec in selected_records:
+            row = dict(rec)
+            row["mapping_index"] = int(map_idx)
+            row["conformer_index"] = int(conf_idx)
+            row["mapping_manifest_obj"] = mapping_manifest
+            row["reuse_info"] = reuse_info
+            row["mapping_error"] = mapping_error
+            row["init_warning"] = str(cand.get("init_warning", "") or "")
+            global_pose_records.append(row)
 
-    if best_selected_records is None:
+    if not global_pose_records:
         if last_mapping_error:
             raise RuntimeError(f"All SMARTS mapping docking attempts failed: {last_mapping_error}")
         raise RuntimeError("All SMARTS mapping docking attempts failed")
 
-    best_cnfrs = [x["cnfr"] for x in best_selected_records]
+    use_rescore = bool(cfg["rescoring"].get("enabled", False))
+    global_ranked = _rank_pose_records(global_pose_records, use_rescore=use_rescore)
+    final_filter_cfg = cfg["outputs"].get("final_rmsd_filter", {}) or {}
+    final_filter_enabled = bool(final_filter_cfg.get("enabled", False))
+    final_filter_threshold = float(final_filter_cfg.get("threshold", 0.5))
+    final_filter_removed = 0
+    final_pool = global_ranked
+    if final_filter_enabled:
+        final_pool, final_filter_removed = _filter_ranked_records_by_global_rmsd(
+            global_ranked,
+            final_filter_threshold,
+        )
 
-    # Rebuild ligand object for trajectory export from selected conformations.
-    export_pdbqt = best_input_pdbqt or lig_pdbqt
-    export_ligand = LigandConformation(export_pdbqt)
-    box_center = np.mean(template_core_xyz, axis=0).tolist()
-    export_ligand.ligand_center[0][0] = box_center[0]
-    export_ligand.ligand_center[0][1] = box_center[1]
-    export_ligand.ligand_center[0][2] = box_center[2]
+    top_n = int(cfg["outputs"]["top_n"])
+    final_selected = final_pool[:top_n]
+    if not final_selected:
+        raise RuntimeError("No poses left after final global filtering")
 
-    temp_pdbqt = os.path.join(ligand_work, f"{ligand_id}.poses.pdbqt")
     out_sdf = os.path.join(poses_dir, f"{ligand_id}.sdf")
-    write_ligand_traj(
-        best_cnfrs,
-        export_ligand,
-        temp_pdbqt,
-        information={
-            f"primary_{cfg['docking']['primary_scorer']}": [x["primary"] for x in best_selected_records],
-            "rescore": [x["rescore"] for x in best_selected_records],
-            "core_rmsd": [x["core_rmsd"] for x in best_selected_records],
-        },
+    _write_pose_records_sdf(
+        pose_records=final_selected,
+        out_sdf=out_sdf,
+        primary_name=cfg["docking"]["primary_scorer"],
     )
-    _to_pdbqt(temp_pdbqt, out_sdf)
+
+    best = final_selected[0]
+    best_mapping_index = int(best["mapping_index"])
+    best_conformer_index = int(best["conformer_index"])
+    best_manifest = best.get("mapping_manifest_obj")
+    best_reuse_info = best.get("reuse_info")
+    best_error_note = str(best.get("mapping_error", "") or "")
+    best_init_warning = str(best.get("init_warning", "") or "")
 
     manifest_path = os.path.join(manifests_dir, f"{ligand_id}.mapping.yaml")
     if best_manifest is None:
@@ -1494,6 +1562,19 @@ def _run_single_ligand(
         "cap_removed": int(cap_removed_total),
         "accepted_candidates": candidate_sources,
     }
+    best_manifest["final_pose_selection"] = {
+        "ranking_metric": "rescore" if use_rescore else "primary",
+        "global_pose_count_before_filter": int(len(global_ranked)),
+        "global_pose_count_after_filter": int(len(final_pool)),
+        "top_n_requested": int(top_n),
+        "top_n_written": int(len(final_selected)),
+        "final_rmsd_filter": {
+            "enabled": bool(final_filter_enabled),
+            "metric": "symmetry_aware_heavy_atom_rmsd",
+            "threshold": float(final_filter_threshold),
+            "duplicates_removed": int(final_filter_removed),
+        },
+    }
     if best_reuse_info:
         best_manifest["reuse"] = {
             "reused_docking": bool(best_reuse_info.get("reused_docking", False)),
@@ -1504,7 +1585,6 @@ def _run_single_ligand(
     with open(manifest_path, "w", encoding="utf-8") as tf:
         yaml.safe_dump(best_manifest, tf, sort_keys=False)
 
-    best = best_selected_records[0]
     error_messages = []
     if truncated:
         error_messages.append(
