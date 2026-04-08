@@ -59,6 +59,19 @@ For receptor input you can use either:
 
 See `config.example.yaml` for the schema.
 
+## Scoring Support
+
+The following scorers are supported in this repository setup:
+- `vina`
+- `deeprmsd`
+- `rmsd-vina`
+
+The following OpenDock scorers are currently **not supported out-of-the-box** here:
+- `zranker`
+- `sfct`
+
+They depend on external pipelines with hardcoded paths in upstream OpenDock, so they typically fail or return fallback scores unless those external tools/paths are reconfigured.
+
 ## Notes
 
 Machine-specific environment and path notes should go to `AGENTS.MD`, not to this README.
