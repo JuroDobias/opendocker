@@ -44,6 +44,7 @@ Current core constraint is based on template-derived ligand-protein distance res
   - `force_constant` (penalty strength)
 - rank poses globally across all candidates and keep `outputs.top_n`
 - optional final global symmetry-aware heavy-atom RMSD filtering (`outputs.final_rmsd_filter`)
+- optional final score-window filtering before `top_n` (`outputs.final_score_filter`)
 
 ## Inputs
 

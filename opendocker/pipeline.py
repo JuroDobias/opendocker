@@ -278,6 +278,14 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     frf.setdefault("threshold", 0.5)
     if float(frf["threshold"]) < 0:
         raise ValueError("outputs.final_rmsd_filter.threshold must be >= 0")
+    outputs.setdefault("final_score_filter", {})
+    fsf = outputs["final_score_filter"]
+    if not isinstance(fsf, dict):
+        raise ValueError("outputs.final_score_filter must be a mapping")
+    fsf.setdefault("enabled", False)
+    fsf.setdefault("max_percent_worse_than_best", 0.0)
+    if float(fsf["max_percent_worse_than_best"]) < 0:
+        raise ValueError("outputs.final_score_filter.max_percent_worse_than_best must be >= 0")
 
     return cfg
 
@@ -1525,6 +1533,20 @@ def _run_single_ligand(
             final_filter_threshold,
         )
 
+    score_filter_cfg = cfg["outputs"].get("final_score_filter", {}) or {}
+    score_filter_enabled = bool(score_filter_cfg.get("enabled", False))
+    score_filter_percent = float(score_filter_cfg.get("max_percent_worse_than_best", 0.0))
+    ranking_metric = "rescore" if use_rescore else "primary"
+    score_best = None
+    score_cutoff = None
+    score_filtered_out = 0
+    if score_filter_enabled and final_pool:
+        score_best = float(final_pool[0][ranking_metric])
+        score_cutoff = float(score_best + abs(score_best) * score_filter_percent / 100.0)
+        before_count = len(final_pool)
+        final_pool = [x for x in final_pool if float(x[ranking_metric]) <= float(score_cutoff)]
+        score_filtered_out = int(before_count - len(final_pool))
+
     top_n = int(cfg["outputs"]["top_n"])
     final_selected = final_pool[:top_n]
     if not final_selected:
@@ -1568,9 +1590,10 @@ def _run_single_ligand(
         "accepted_candidates": candidate_sources,
     }
     best_manifest["final_pose_selection"] = {
-        "ranking_metric": "rescore" if use_rescore else "primary",
+        "ranking_metric": ranking_metric,
         "global_pose_count_before_filter": int(len(global_ranked)),
-        "global_pose_count_after_filter": int(len(final_pool)),
+        "global_pose_count_after_rmsd_filter": int(len(global_ranked) - final_filter_removed),
+        "global_pose_count_after_score_filter": int(len(final_pool)),
         "top_n_requested": int(top_n),
         "top_n_written": int(len(final_selected)),
         "final_rmsd_filter": {
@@ -1578,6 +1601,14 @@ def _run_single_ligand(
             "metric": "symmetry_aware_heavy_atom_rmsd",
             "threshold": float(final_filter_threshold),
             "duplicates_removed": int(final_filter_removed),
+        },
+        "final_score_filter": {
+            "enabled": bool(score_filter_enabled),
+            "metric": ranking_metric,
+            "max_percent_worse_than_best": float(score_filter_percent),
+            "best_score": score_best,
+            "cutoff_score": score_cutoff,
+            "filtered_out": int(score_filtered_out),
         },
     }
     if best_reuse_info:

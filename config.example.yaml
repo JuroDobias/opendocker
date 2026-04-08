@@ -64,3 +64,6 @@ outputs:
   final_rmsd_filter:
     enabled: false
     threshold: 0.5
+  final_score_filter:
+    enabled: false
+    max_percent_worse_than_best: 0.0
